@@ -646,6 +646,9 @@ class EnsembleReasoner:
         probabilities and is the state-of-the-art aggregation method.
 
         Formula: avg_logit = mean(log(p/(1-p))), final_p = sigmoid(avg_logit)
+        
+        For non-mutually-exclusive events (detected by raw prob sums > 1.3),
+        skips normalization so each outcome is scored independently.
         """
         import math
 
@@ -679,10 +682,26 @@ class EnsembleReasoner:
             # Convert back to probability
             aggregated_probs[outcome] = 1.0 / (1.0 + math.exp(-avg_logit))
 
-        # Normalize to sum to 1.0
-        total = sum(aggregated_probs.values())
-        if total > 0:
-            aggregated_probs = {k: v / total for k, v in aggregated_probs.items()}
+        # Detect mutually exclusive vs non-mutually-exclusive
+        # If models returned probs that sum well above 1.0, it's non-mutually-exclusive
+        # Check the raw model outputs to detect this
+        raw_sums = []
+        for probs, _ in results:
+            raw_sum = sum(probs.get(o, 0.0) for o in outcomes)
+            raw_sums.append(raw_sum)
+        avg_raw_sum = sum(raw_sums) / len(raw_sums) if raw_sums else 1.0
+
+        if avg_raw_sum <= 1.3:
+            # Mutually exclusive — normalize to sum to 1.0
+            total = sum(aggregated_probs.values())
+            if total > 0:
+                aggregated_probs = {k: v / total for k, v in aggregated_probs.items()}
+        else:
+            # Non-mutually-exclusive — keep independent probabilities
+            logger.info(
+                f"Non-mutually-exclusive detected (avg raw sum={avg_raw_sum:.2f}), "
+                "skipping normalization"
+            )
 
         # Merge reasoning traces (same as before)
         all_evidence = []

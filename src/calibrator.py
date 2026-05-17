@@ -115,22 +115,23 @@ class CalibrationModule:
             return {k: 1.0 / n for k in probabilities}
         return {k: v / total for k, v in probabilities.items()}
 
-    def calibrate(self, probabilities: Dict[str, float]) -> Dict[str, float]:
+    def calibrate(self, probabilities: Dict[str, float], normalize: bool = True) -> Dict[str, float]:
         """Apply full calibration pipeline.
 
         Steps:
             1. Apply Platt scaling (extremize via log-odds transformation)
             2. Apply overconfidence shrinkage for values > 0.90 or < 0.10
             3. Clamp to [0.01, 0.99]
-            4. Normalize to sum to 1.0
+            4. Normalize to sum to 1.0 (only if normalize=True)
 
         On error, returns original estimates clamped and normalized.
 
         Args:
             probabilities: Dict mapping outcome labels to raw probability values.
+            normalize: Whether to normalize to sum to 1.0 (False for non-mutually-exclusive).
 
         Returns:
-            Calibrated and normalized probability dict.
+            Calibrated probability dict.
         """
         try:
             calibrated = {}
@@ -143,8 +144,10 @@ class CalibrationModule:
                 clamped = self.clamp(shrunk)
                 calibrated[outcome] = clamped
 
-            # Step 4: Normalize to sum to 1.0
-            return self.normalize(calibrated)
+            # Step 4: Normalize to sum to 1.0 (only for mutually exclusive)
+            if normalize:
+                return self.normalize(calibrated)
+            return calibrated
 
         except Exception as e:
             logger.warning(
@@ -152,13 +155,16 @@ class CalibrationModule:
             )
             # Fallback: clamp and normalize originals
             fallback = {k: self.clamp(v) for k, v in probabilities.items()}
-            return self.normalize(fallback)
+            if normalize:
+                return self.normalize(fallback)
+            return fallback
 
     def calibrate_with_market(
         self,
         probabilities: Dict[str, float],
         market_prices: Optional[Dict[str, float]] = None,
         anchor_weight: Optional[float] = None,
+        normalize: bool = True,
     ) -> Dict[str, float]:
         """Calibrate with market price anchoring.
 
@@ -174,6 +180,7 @@ class CalibrationModule:
                 (already reconciled by supervisor when market data exists).
             market_prices: Optional dict mapping outcome labels to market prices (0-1).
             anchor_weight: How much to additionally anchor toward market (0-1).
+            normalize: Whether to normalize to sum to 1.0 (False for non-mutually-exclusive).
 
         Returns:
             Final calibrated probability dict.
@@ -183,7 +190,7 @@ class CalibrationModule:
 
         # If no market prices, apply standard calibration (with Platt scaling)
         if not market_prices:
-            return self.calibrate(probabilities)
+            return self.calibrate(probabilities, normalize=normalize)
 
         # With market prices: skip Platt scaling, just anchor + clamp + normalize
         # The supervisor already reconciled our prediction with market data,
@@ -199,11 +206,13 @@ class CalibrationModule:
                 else:
                     anchored[outcome] = self.clamp(pred)
 
-            # Normalize after anchoring
-            return self.normalize(anchored)
+            # Normalize after anchoring (only for mutually exclusive)
+            if normalize:
+                return self.normalize(anchored)
+            return anchored
 
         except Exception as e:
             logger.warning(
                 "Market anchoring failed, returning standard calibration: %s", e
             )
-            return self.calibrate(probabilities)
+            return self.calibrate(probabilities, normalize=normalize)

@@ -1,8 +1,10 @@
 """Response validation and correction for prediction outputs.
 
 Validates that prediction probabilities conform to the required format
-(correct outcome count, range [0.01, 0.99], market field match, sum to 1.0)
-and provides correction and fallback mechanisms.
+(correct outcome count, range [0.01, 0.99], market field match).
+For mutually exclusive events, also validates sum to 1.0.
+For non-mutually-exclusive events (top-K), skips sum validation.
+Provides correction and fallback mechanisms.
 """
 
 from typing import Dict, List, Tuple
@@ -12,7 +14,8 @@ class ResponseValidator:
     """Validates and corrects prediction responses before sending."""
 
     def validate(
-        self, probabilities: Dict[str, float], outcomes: List[str]
+        self, probabilities: Dict[str, float], outcomes: List[str],
+        mutually_exclusive: bool = True,
     ) -> Tuple[bool, List[str]]:
         """Validate prediction against all rules.
 
@@ -20,11 +23,12 @@ class ResponseValidator:
         1. One entry per outcome (outcome count matches)
         2. Each probability in [0.01, 0.99]
         3. Each market field matches an outcome
-        4. Sum equals 1.0 (within 0.001 tolerance)
+        4. Sum equals 1.0 (within 0.001 tolerance) — ONLY for mutually exclusive events
 
         Args:
             probabilities: Dict mapping outcome label -> probability value.
             outcomes: List of expected outcome labels from the event.
+            mutually_exclusive: Whether outcomes are mutually exclusive.
 
         Returns:
             Tuple of (is_valid, list_of_violations).
@@ -57,29 +61,32 @@ class ResponseValidator:
             if outcome not in probabilities:
                 violations.append(f"Missing probability for outcome '{outcome}'")
 
-        # Check 4: Sum equals 1.0 within tolerance of 0.001
-        total = sum(probabilities.values())
-        if abs(total - 1.0) > 0.001:
-            violations.append(
-                f"Probabilities sum to {total}, expected 1.0 (tolerance 0.001)"
-            )
+        # Check 4: Sum equals 1.0 within tolerance — ONLY for mutually exclusive
+        if mutually_exclusive:
+            total = sum(probabilities.values())
+            if abs(total - 1.0) > 0.001:
+                violations.append(
+                    f"Probabilities sum to {total}, expected 1.0 (tolerance 0.001)"
+                )
 
         is_valid = len(violations) == 0
         return is_valid, violations
 
     def correct(
-        self, probabilities: Dict[str, float], outcomes: List[str]
+        self, probabilities: Dict[str, float], outcomes: List[str],
+        mutually_exclusive: bool = True,
     ) -> Dict[str, float]:
         """Attempt to correct invalid predictions.
 
         Steps:
         1. Add missing outcomes with uniform probability (1/N)
         2. Clamp values to [0.01, 0.99]
-        3. Normalize to sum to 1.0
+        3. Normalize to sum to 1.0 (only for mutually exclusive events)
 
         Args:
             probabilities: Dict mapping outcome label -> probability value.
             outcomes: List of expected outcome labels from the event.
+            mutually_exclusive: Whether outcomes are mutually exclusive.
 
         Returns:
             Corrected probabilities dict mapping outcome -> probability.
@@ -99,14 +106,15 @@ class ResponseValidator:
         for outcome in corrected:
             corrected[outcome] = max(0.01, min(0.99, corrected[outcome]))
 
-        # Step 3: Normalize to sum to 1.0
+        # Step 3: Normalize to sum to 1.0 (only for mutually exclusive)
+        if not mutually_exclusive:
+            return corrected
+
         total = sum(corrected.values())
         if total > 0:
             corrected = {k: v / total for k, v in corrected.items()}
 
         # Iteratively clamp and redistribute to ensure bounds are respected
-        # Simple normalize can push clamped values back out of range,
-        # so we use iterative clamping with redistribution.
         for _ in range(20):  # Max iterations to converge
             all_valid = True
             clamped_total = 0.0

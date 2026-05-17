@@ -92,6 +92,65 @@ CATEGORY_ANCHOR_MULTIPLIER = {
     "general": 1.0,        # Default
 }
 
+
+# --- Non-Mutually-Exclusive Detection ---
+
+# Keywords that suggest a top-K / non-mutually-exclusive event
+_TOP_K_KEYWORDS = [
+    "top 5", "top 10", "top 3", "top 4", "top 8", "top 15", "top 20",
+    "qualify", "advance", "make it to", "finish in the top",
+    "which of these", "which of the following",
+    "semifinal", "semi-final", "quarterfinal", "quarter-final",
+    "will qualify", "will advance", "will make",
+]
+
+
+def is_non_mutually_exclusive(event_title: str, event_description: str, outcomes: List[str]) -> bool:
+    """Detect if an event has non-mutually-exclusive outcomes (top-K style).
+    
+    Heuristics:
+    1. Title/description contains top-K keywords
+    2. Many outcomes (>4) with no "Yes"/"No" pattern
+    3. Outcomes look like entity names (countries, teams, people) rather than
+       mutually exclusive choices
+    
+    Args:
+        event_title: The event title.
+        event_description: The event description/context.
+        outcomes: List of outcome labels.
+    
+    Returns:
+        True if the event appears to be non-mutually-exclusive.
+    """
+    combined_text = (event_title + " " + event_description).lower()
+    
+    # Check for top-K keywords
+    for keyword in _TOP_K_KEYWORDS:
+        if keyword in combined_text:
+            return True
+    
+    # Binary events (Yes/No) are always mutually exclusive
+    if len(outcomes) == 2:
+        outcome_set = {o.lower() for o in outcomes}
+        if outcome_set == {"yes", "no"} or outcome_set == {"true", "false"}:
+            return False
+    
+    # If there are many outcomes (>4) and they look like entity names
+    # (not "Option A", "Option B" style), likely non-mutually-exclusive
+    if len(outcomes) > 4:
+        # Check if outcomes look like entity names (countries, teams, people)
+        # Simple heuristic: if none of the outcomes contain common choice words
+        choice_words = {"yes", "no", "true", "false", "option", "choice", "over", "under"}
+        outcomes_lower = [o.lower() for o in outcomes]
+        if not any(word in o for o in outcomes_lower for word in choice_words):
+            # Many entity-like outcomes — could be top-K
+            # But only if the title suggests selection/qualification
+            selection_words = ["which", "who", "what", "top", "best", "finish", "win"]
+            if any(word in combined_text for word in selection_words):
+                return True
+    
+    return False
+
 # --- Startup validation ---
 # load_config() validates required env vars and calls sys.exit(1) if missing
 try:
@@ -352,6 +411,16 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
     # Step 1: Route (classify category and complexity)
     routing_config = classify_event(event)
 
+    # Detect non-mutually-exclusive events (top-K style)
+    mutually_exclusive = not is_non_mutually_exclusive(
+        event.title, event.description, event.outcomes
+    )
+    if not mutually_exclusive:
+        logger.info(
+            f"Event {event.event_ticker} detected as NON-mutually-exclusive (top-K). "
+            "Skipping normalization throughout pipeline."
+        )
+
     # Extract market stats for downstream use
     market_stats = event.market_stats
     market_prices = extract_market_prices(market_stats)
@@ -554,10 +623,11 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
 
     if market_prices:
         calibrated = calibrator.calibrate_with_market(
-            aggregated, market_prices, anchor_weight=final_anchor_weight
+            aggregated, market_prices, anchor_weight=final_anchor_weight,
+            normalize=mutually_exclusive,
         )
     else:
-        calibrated = calibrator.calibrate(aggregated)
+        calibrated = calibrator.calibrate(aggregated, normalize=mutually_exclusive)
 
     # Step 7.5: Confidence check — use market as default when we have no edge
     # Key hackathon insight: "Only make prediction when you are confident enough,
@@ -575,21 +645,22 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
                 f"using market prices"
             )
             calibrated = {o: market_prices.get(o, 1.0 / len(event.outcomes)) for o in event.outcomes}
-            # Normalize market prices (they may not sum to 1)
-            total = sum(calibrated.values())
-            if total > 0:
-                calibrated = {k: v / total for k, v in calibrated.items()}
+            # Normalize market prices only for mutually exclusive events
+            if mutually_exclusive:
+                total = sum(calibrated.values())
+                if total > 0:
+                    calibrated = {k: v / total for k, v in calibrated.items()}
 
     # Step 8: Validate response
-    is_valid, violations = validator.validate(calibrated, event.outcomes)
+    is_valid, violations = validator.validate(calibrated, event.outcomes, mutually_exclusive=mutually_exclusive)
     if not is_valid:
         logger.warning(
             f"Validation failed for {event.event_ticker}: {violations}. "
             "Attempting correction."
         )
-        calibrated = validator.correct(calibrated, event.outcomes)
+        calibrated = validator.correct(calibrated, event.outcomes, mutually_exclusive=mutually_exclusive)
         # Re-validate after correction
-        is_valid, violations = validator.validate(calibrated, event.outcomes)
+        is_valid, violations = validator.validate(calibrated, event.outcomes, mutually_exclusive=mutually_exclusive)
         if not is_valid:
             logger.error(
                 f"Correction failed for {event.event_ticker}: {violations}. "
