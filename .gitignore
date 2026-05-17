@@ -1,6 +1,8 @@
 # Environment & Secrets
 .env
 *.env.local
+*.pem
+rsaprivate*
 
 # Python
 __pycache__/
