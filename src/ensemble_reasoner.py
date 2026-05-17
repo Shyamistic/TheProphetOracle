@@ -268,6 +268,8 @@ class EnsembleReasoner:
             logger.error("All ensemble models failed, using fallback prediction")
             return self._fallback_prediction(event, time.time() - start_time)
 
+        had_disagreement = False
+
         if len(successful_results) == 1:
             # Only one model succeeded — use its result directly
             probs, trace = successful_results[0]
@@ -278,6 +280,7 @@ class EnsembleReasoner:
                 self.featherless_client is not None
                 and self._models_disagree(successful_results, event.outcomes)
             ):
+                had_disagreement = True
                 # Models disagree significantly — add Featherless tiebreaker
                 logger.info(
                     "Ensemble: models disagree >15%, invoking Featherless tiebreaker "
@@ -296,6 +299,10 @@ class EnsembleReasoner:
                                 f"{len(successful_results)} opinions")
                 except Exception as e:
                     logger.warning(f"Featherless tiebreaker failed: {e}")
+            elif self._models_disagree(successful_results, event.outcomes):
+                # Disagreement detected but no Featherless client
+                had_disagreement = True
+                logger.info("Ensemble: models disagree >15% (no tiebreaker available)")
 
             # Take median across all successful results
             probs, trace = self._aggregate_median(successful_results, event.outcomes)
@@ -314,6 +321,7 @@ class EnsembleReasoner:
             probabilities=probs,
             reasoning_trace=trace,
             duration_seconds=duration,
+            had_disagreement=had_disagreement,
         )
 
     def _models_disagree(

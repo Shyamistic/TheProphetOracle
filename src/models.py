@@ -134,6 +134,7 @@ class PredictionResult:
     probabilities: Dict[str, float]  # outcome -> probability
     reasoning_trace: ReasoningTrace
     duration_seconds: float
+    had_disagreement: bool = False  # True if ensemble models disagreed >15%
 
 
 @dataclass

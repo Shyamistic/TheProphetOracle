@@ -9,6 +9,7 @@ import asyncio
 import logging
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import httpx
@@ -40,6 +41,52 @@ from src.supervisor import SupervisorAgent
 from src.validator import ResponseValidator
 
 logger = logging.getLogger(__name__)
+
+
+# --- Upgrade 2: Time-to-Resolution Adaptive Strategy ---
+
+
+def get_adaptive_anchor_weight(close_time_str: str, base_weight: float = 0.3) -> float:
+    """Adjust market anchor weight based on time to resolution.
+
+    Near-term events (2-3 days): market is very efficient, anchor 80%
+    Medium-term (4-7 days): balanced, anchor 50%
+    Long-term (8-14 days): market less efficient, anchor 30%
+
+    Args:
+        close_time_str: ISO format close time string.
+        base_weight: Default weight if parsing fails.
+
+    Returns:
+        Adaptive anchor weight between 0.0 and 1.0.
+    """
+    try:
+        close_time = datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        days_remaining = (close_time - now).total_seconds() / 86400
+
+        if days_remaining <= 3:
+            return 0.80  # Market very efficient near resolution
+        elif days_remaining <= 7:
+            return 0.50  # Balanced
+        else:
+            return 0.30  # Trust our research more for longer-term
+    except Exception:
+        return base_weight
+
+
+# --- Upgrade 3: Category-Specific Confidence Tuning ---
+
+
+CATEGORY_ANCHOR_MULTIPLIER = {
+    "sports": 1.5,        # Anchor MORE to market (sports bettors are sharp)
+    "entertainment": 1.3,  # Anchor more (we have no edge on reality TV)
+    "economics": 0.8,      # Trust our research more
+    "geopolitics": 0.7,    # Trust our research more (markets often slow on geopolitics)
+    "technology": 0.9,     # Balanced
+    "science": 0.9,        # Balanced
+    "general": 1.0,        # Default
+}
 
 # --- Startup validation ---
 # load_config() validates required env vars and calls sys.exit(1) if missing
@@ -309,6 +356,7 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
             market_ticker=event.market_ticker,
             event_ticker=event.event_ticker,
             outcomes=event.outcomes,
+            title=event.title,
         )
         if fetched:
             market_prices = fetched
@@ -362,9 +410,51 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
     # Step 5: Aggregate predictions
     aggregated = aggregate_predictions(prediction_results, event.outcomes)
 
+    # Step 5.5: Second research pass on disagreement
+    # If ensemble had significant disagreement, do a supplementary search
+    # and re-run supervisor with extra evidence for better reconciliation
+    any_disagreement = any(
+        getattr(pr, "had_disagreement", False) for pr in prediction_results
+    )
+    supplementary_evidence = ""
+    if any_disagreement and search_client:
+        logger.info(
+            f"Ensemble disagreement detected for {event.event_ticker}, "
+            "doing supplementary search"
+        )
+        try:
+            supplementary_results = search_client.search(
+                f"{event.title} latest news update",
+                max_results=3,
+                topic="news",
+                time_range="week",
+            )
+            # Extract summaries from supplementary search
+            supp_items = supplementary_results.get("results", [])
+            if supp_items:
+                supp_summaries = []
+                for item in supp_items[:3]:
+                    content = item.get("content") or item.get("snippet") or ""
+                    if content:
+                        supp_summaries.append(content[:200])
+                if supp_summaries:
+                    supplementary_evidence = (
+                        " [SUPPLEMENTARY EVIDENCE from disagreement re-search]: "
+                        + " | ".join(supp_summaries)
+                    )
+                    logger.info(
+                        f"Got {len(supp_summaries)} supplementary evidence items "
+                        f"for {event.event_ticker}"
+                    )
+        except Exception as e:
+            logger.debug(f"Supplementary search failed for {event.event_ticker}: {e}")
+
     # Step 6: Supervisor reconciliation (if market stats available)
     if market_stats:
         evidence_summary = _build_evidence_summary(research_results)
+        # Append supplementary evidence from disagreement re-search
+        if supplementary_evidence:
+            evidence_summary += supplementary_evidence
         aggregated = await supervisor_agent.reconcile(
             predictions=aggregated,
             market_stats=market_stats,
@@ -374,8 +464,23 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
         )
 
     # Step 7: Calibrate (with market anchoring if available)
+    # Use adaptive anchor weight based on time-to-resolution and category
+    adaptive_weight = get_adaptive_anchor_weight(
+        event.close_time, base_weight=config.market_anchor_weight
+    )
+    category_mult = CATEGORY_ANCHOR_MULTIPLIER.get(routing_config.category.value, 1.0)
+    final_anchor_weight = min(0.90, adaptive_weight * category_mult)
+
+    logger.info(
+        f"Anchor weight for {event.event_ticker}: adaptive={adaptive_weight:.2f}, "
+        f"category_mult={category_mult:.1f} ({routing_config.category.value}), "
+        f"final={final_anchor_weight:.2f}"
+    )
+
     if market_prices:
-        calibrated = calibrator.calibrate_with_market(aggregated, market_prices)
+        calibrated = calibrator.calibrate_with_market(
+            aggregated, market_prices, anchor_weight=final_anchor_weight
+        )
     else:
         calibrated = calibrator.calibrate(aggregated)
 
