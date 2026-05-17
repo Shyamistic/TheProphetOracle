@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 import httpx
 from openai import AsyncOpenAI
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from tavily import TavilyClient
 
 from src.aggregator import aggregate_predictions
@@ -37,10 +37,14 @@ from src.reasoner import ReasoningEngine
 from src.research import run_parallel_research
 from src.router import classify_event
 from src.search_client import SearchClient
+from src.dashboard import get_dashboard_html
 from src.supervisor import SupervisorAgent
 from src.validator import ResponseValidator
 
 logger = logging.getLogger(__name__)
+
+# Global prediction log (in-memory, last N predictions for dashboard)
+prediction_log: List[Dict] = []
 
 
 # --- Upgrade 2: Time-to-Resolution Adaptive Strategy ---
@@ -343,6 +347,8 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
     Returns:
         Dict mapping outcome label to probability.
     """
+    start_time = time.time()
+
     # Step 1: Route (classify category and complexity)
     routing_config = classify_event(event)
 
@@ -524,6 +530,23 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
 
     # Cache the result
     await cache.set(event, calibrated)
+
+    # Log prediction for dashboard
+    prediction_log.append({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event_ticker": event.event_ticker,
+        "title": event.title[:60],
+        "category": routing_config.category.value,
+        "outcomes": event.outcomes[:5],
+        "probabilities": {k: round(v, 4) for k, v in calibrated.items()},
+        "duration": round(time.time() - start_time, 1) if 'start_time' in locals() else 0,
+        "had_disagreement": any(
+            getattr(pr, "had_disagreement", False) for pr in prediction_results
+        ) if prediction_results else False,
+    })
+    # Keep log bounded to last 200 entries
+    if len(prediction_log) > 200:
+        prediction_log[:] = prediction_log[-200:]
 
     return calibrated
 
@@ -804,6 +827,18 @@ async def health_check() -> dict:
 async def get_costs() -> dict:
     """Returns cumulative cost summary."""
     return cost_tracker.get_summary()
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    """Serve the monitoring dashboard HTML page."""
+    return get_dashboard_html()
+
+
+@app.get("/logs")
+async def get_logs():
+    """Return the last 50 predictions from the in-memory log."""
+    return {"predictions": prediction_log[-50:], "total": len(prediction_log)}
 
 
 # --- Error handlers ---
