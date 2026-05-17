@@ -42,6 +42,7 @@ class SupervisorAgent:
         evidence_summary: str = "",
         event_title: str = "",
         outcomes: Optional[List[str]] = None,
+        mutually_exclusive: bool = True,
     ) -> Dict[str, float]:
         """Reconcile our prediction with market prices.
 
@@ -51,6 +52,7 @@ class SupervisorAgent:
             evidence_summary: Brief summary of key evidence found.
             event_title: The event question.
             outcomes: List of outcome labels.
+            mutually_exclusive: Whether outcomes are mutually exclusive.
 
         Returns:
             Adjusted prediction dict.
@@ -65,7 +67,8 @@ class SupervisorAgent:
             return predictions
 
         prompt = self._build_prompt(
-            event_title, outcomes, predictions, market_prices, evidence_summary
+            event_title, outcomes, predictions, market_prices, evidence_summary,
+            mutually_exclusive=mutually_exclusive,
         )
 
         try:
@@ -80,11 +83,11 @@ class SupervisorAgent:
             )
 
             text = response.choices[0].message.content if response.choices else ""
-            return self._parse_response(text, outcomes, predictions, market_prices)
+            return self._parse_response(text, outcomes, predictions, market_prices, mutually_exclusive=mutually_exclusive)
 
         except (Exception, asyncio.TimeoutError) as e:
             logger.warning(f"Supervisor reconciliation failed: {e}. Using weighted blend.")
-            return self._weighted_blend(predictions, market_prices, weight=0.7)
+            return self._weighted_blend(predictions, market_prices, weight=0.7, mutually_exclusive=mutually_exclusive)
 
     def _extract_prices(self, market_stats: Optional[Dict]) -> Optional[Dict[str, float]]:
         """Extract outcome -> last_price mapping from market_stats."""
@@ -108,9 +111,12 @@ class SupervisorAgent:
         our_prediction: Dict[str, float],
         market_prices: Dict[str, float],
         evidence_summary: str,
+        mutually_exclusive: bool = True,
     ) -> str:
         our_str = ", ".join(f"{k}: {v:.1%}" for k, v in our_prediction.items())
         market_str = ", ".join(f"{k}: {v:.1%}" for k, v in market_prices.items())
+
+        normalization_rule = "7. Probabilities must sum to 1.0." if mutually_exclusive else "7. Probabilities are INDEPENDENT (non-mutually-exclusive event). They do NOT need to sum to 1.0. Each represents P(this outcome is in the winning set)."
 
         return f"""You are a forecasting supervisor. Your job is to produce the FINAL probability estimate by reconciling two sources:
 
@@ -129,7 +135,7 @@ RULES FOR RECONCILIATION:
 4. If they disagree significantly, ask: does our evidence justify deviating from the market?
 5. Be skeptical of large deviations from market — the market is usually right.
 6. Never go below 0.05 or above 0.95 for any outcome.
-7. Probabilities must sum to 1.0.
+{normalization_rule}
 
 Return ONLY a JSON object with your final probabilities:
 {{"probabilities": {{{", ".join(f'"{o}": <float>' for o in outcomes)}}}}}"""
@@ -140,6 +146,7 @@ Return ONLY a JSON object with your final probabilities:
         outcomes: List[str],
         our_prediction: Dict[str, float],
         market_prices: Dict[str, float],
+        mutually_exclusive: bool = True,
     ) -> Dict[str, float]:
         """Parse supervisor response, fallback to weighted blend on failure."""
         cleaned = text.strip()
@@ -160,22 +167,24 @@ Return ONLY a JSON object with your final probabilities:
                 p = float(probs.get(outcome, our_prediction.get(outcome, 1.0 / len(outcomes))))
                 result[outcome] = max(0.05, min(0.95, p))
 
-            # Normalize
-            total = sum(result.values())
-            if total > 0:
-                result = {k: v / total for k, v in result.items()}
+            # Normalize only for mutually exclusive
+            if mutually_exclusive:
+                total = sum(result.values())
+                if total > 0:
+                    result = {k: v / total for k, v in result.items()}
 
             return result
 
         except (json.JSONDecodeError, ValueError, TypeError) as e:
             logger.warning(f"Failed to parse supervisor response: {e}")
-            return self._weighted_blend(our_prediction, market_prices, weight=0.7)
+            return self._weighted_blend(our_prediction, market_prices, weight=0.7, mutually_exclusive=mutually_exclusive)
 
     def _weighted_blend(
         self,
         our_prediction: Dict[str, float],
         market_prices: Dict[str, float],
         weight: float = 0.7,
+        mutually_exclusive: bool = True,
     ) -> Dict[str, float]:
         """Simple weighted average: weight * ours + (1-weight) * market."""
         result = {}
@@ -184,9 +193,10 @@ Return ONLY a JSON object with your final probabilities:
             market_p = market_prices.get(outcome, 0.5)
             result[outcome] = our_p * weight + market_p * (1 - weight)
 
-        # Normalize
-        total = sum(result.values())
-        if total > 0:
-            result = {k: v / total for k, v in result.items()}
+        # Normalize only for mutually exclusive
+        if mutually_exclusive:
+            total = sum(result.values())
+            if total > 0:
+                result = {k: v / total for k, v in result.items()}
 
         return result

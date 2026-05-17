@@ -478,12 +478,13 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
     prediction_results = []
     for research_result in research_results:
         prediction = await ensemble_reasoner.predict(
-            event, research_result, market_stats=market_stats
+            event, research_result, market_stats=market_stats,
+            mutually_exclusive=mutually_exclusive,
         )
         prediction_results.append(prediction)
 
     # Step 5: Aggregate predictions
-    aggregated = aggregate_predictions(prediction_results, event.outcomes)
+    aggregated = aggregate_predictions(prediction_results, event.outcomes, mutually_exclusive=mutually_exclusive)
 
     # Step 5.5: Second research pass on disagreement
     # If ensemble had significant disagreement, do a supplementary search
@@ -605,6 +606,7 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
             evidence_summary=evidence_summary,
             event_title=event.title,
             outcomes=event.outcomes,
+            mutually_exclusive=mutually_exclusive,
         )
 
     # Step 7: Calibrate (with market anchoring if available)

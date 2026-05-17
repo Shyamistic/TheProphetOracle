@@ -34,7 +34,8 @@ def _is_mutually_exclusive(predictions: List[PredictionResult], outcomes: List[s
 
 
 def aggregate_predictions(
-    predictions: List[PredictionResult], outcomes: List[str]
+    predictions: List[PredictionResult], outcomes: List[str],
+    mutually_exclusive: bool = True,
 ) -> Dict[str, float]:
     """Compute mean probability across all agent predictions.
 
@@ -45,6 +46,8 @@ def aggregate_predictions(
     Args:
         predictions: List of PredictionResult from parallel agents.
         outcomes: List of outcome labels.
+        mutually_exclusive: Whether outcomes are mutually exclusive. If False,
+            skips normalization regardless of what models returned.
 
     Returns:
         Dict mapping outcome -> mean probability.
@@ -64,7 +67,7 @@ def aggregate_predictions(
         mean_probs[outcome] = total / num_agents
 
     # Only normalize for mutually exclusive events
-    if _is_mutually_exclusive(predictions, outcomes):
+    if mutually_exclusive:
         prob_sum = sum(mean_probs.values())
         if prob_sum > 0:
             mean_probs = {k: v / prob_sum for k, v in mean_probs.items()}
@@ -73,7 +76,7 @@ def aggregate_predictions(
             mean_probs = {outcome: 1.0 / n for outcome in outcomes}
     else:
         logger.info(
-            f"Non-mutually-exclusive event detected, skipping normalization "
+            f"Non-mutually-exclusive event: skipping normalization "
             f"(raw sum={sum(mean_probs.values()):.2f})"
         )
 

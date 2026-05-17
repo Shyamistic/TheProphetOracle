@@ -244,6 +244,7 @@ class EnsembleReasoner:
         event: EventRequest,
         research: ResearchResult,
         market_stats: Optional[dict] = None,
+        mutually_exclusive: bool = True,
     ) -> PredictionResult:
         """Generate probability estimates using 3-model ensemble.
 
@@ -263,6 +264,7 @@ class EnsembleReasoner:
             event: The event to predict.
             research: Research results with gathered evidence.
             market_stats: Optional market price information.
+            mutually_exclusive: Whether outcomes are mutually exclusive.
 
         Returns:
             A PredictionResult with ensemble-aggregated probabilities.
@@ -273,7 +275,8 @@ class EnsembleReasoner:
         # Run all 3 OpenRouter models in parallel
         model_tasks = [
             self._call_model(
-                self.openrouter_client, model, prompt, event.outcomes, f"openrouter/{model}"
+                self.openrouter_client, model, prompt, event.outcomes, f"openrouter/{model}",
+                mutually_exclusive=mutually_exclusive,
             )
             for model in self.models
         ]
@@ -319,6 +322,7 @@ class EnsembleReasoner:
                         prompt,
                         event.outcomes,
                         "featherless/tiebreaker",
+                        mutually_exclusive=mutually_exclusive,
                     )
                     successful_results.append(tiebreaker_result)
                     logger.info("Featherless tiebreaker succeeded, now have "
@@ -331,7 +335,7 @@ class EnsembleReasoner:
                 logger.info("Ensemble: models disagree >15% (no tiebreaker available)")
 
             # Aggregate using logit-space averaging (BLF method)
-            probs, trace = self._aggregate_logit_average(successful_results, event.outcomes)
+            probs, trace = self._aggregate_logit_average(successful_results, event.outcomes, mutually_exclusive=mutually_exclusive)
 
             # Log the spread
             spread_info = self._compute_spread(successful_results, event.outcomes)
@@ -403,6 +407,7 @@ class EnsembleReasoner:
         prompt: str,
         outcomes: List[str],
         model_label: str,
+        mutually_exclusive: bool = True,
     ) -> Tuple[Dict[str, float], ReasoningTrace]:
         """Call a single model and parse its response.
 
@@ -412,6 +417,7 @@ class EnsembleReasoner:
             prompt: The structured prompt.
             outcomes: Expected outcome labels.
             model_label: Label for logging.
+            mutually_exclusive: Whether outcomes are mutually exclusive.
 
         Returns:
             Tuple of (probabilities dict, reasoning trace).
@@ -439,7 +445,7 @@ class EnsembleReasoner:
         logger.debug(f"Raw response from {model_label}: {llm_text[:200]}...")
 
         # Parse the response
-        probs, trace = self._parse_response(llm_text, outcomes)
+        probs, trace = self._parse_response(llm_text, outcomes, mutually_exclusive=mutually_exclusive)
         logger.info(
             f"Model {model_label} ({model}) probabilities: "
             f"{{{', '.join(f'{k}: {v:.3f}' for k, v in probs.items())}}}"
@@ -447,13 +453,14 @@ class EnsembleReasoner:
         return probs, trace
 
     def _parse_response(
-        self, llm_text: str, outcomes: List[str]
+        self, llm_text: str, outcomes: List[str], mutually_exclusive: bool = True,
     ) -> Tuple[Dict[str, float], ReasoningTrace]:
         """Parse LLM JSON response into probabilities and trace.
 
         Args:
             llm_text: Raw text response from the LLM.
             outcomes: Expected outcome labels.
+            mutually_exclusive: Whether outcomes are mutually exclusive.
 
         Returns:
             Tuple of (normalized probabilities, reasoning trace).
@@ -490,7 +497,7 @@ class EnsembleReasoner:
         if not raw_probs:
             raise ValueError("No probabilities found in response")
 
-        probs = self._normalize_probabilities(raw_probs, outcomes)
+        probs = self._normalize_probabilities(raw_probs, outcomes, mutually_exclusive=mutually_exclusive)
 
         # Extract reasoning trace
         trace_data = data.get("reasoning_trace", {})
@@ -499,15 +506,13 @@ class EnsembleReasoner:
         return probs, trace
 
     def _normalize_probabilities(
-        self, raw_probs: Dict[str, float], outcomes: List[str]
+        self, raw_probs: Dict[str, float], outcomes: List[str],
+        mutually_exclusive: bool = True,
     ) -> Dict[str, float]:
         """Normalize probabilities to valid range.
 
         For mutually exclusive events: normalizes to sum to 1.0
         For non-mutually-exclusive events: keeps raw values (each is independent)
-        
-        Detection: if raw probs sum to roughly 1.0 (within 0.3), treat as mutually exclusive.
-        If they sum to significantly more (e.g., 3.0 for a top-5 event), keep as-is.
         """
         probs: Dict[str, float] = {}
 
@@ -521,19 +526,17 @@ class EnsembleReasoner:
             p = max(0.01, min(0.99, p))
             probs[outcome] = p
 
-        # Detect if mutually exclusive: raw sum near 1.0
-        total = sum(probs.values())
-        n = len(outcomes)
-        
-        if total > 0 and abs(total - 1.0) < 0.3:
-            # Looks mutually exclusive — normalize to sum to 1.0
-            probs = {k: v / total for k, v in probs.items()}
-            # Final clamp after normalization
-            probs = {k: max(0.01, min(0.99, v)) for k, v in probs.items()}
-            # Re-normalize after clamping
+        # Only normalize for mutually exclusive events
+        if mutually_exclusive:
             total = sum(probs.values())
-            if abs(total - 1.0) > 0.001:
+            if total > 0 and abs(total - 1.0) > 0.01:
                 probs = {k: v / total for k, v in probs.items()}
+                # Final clamp after normalization
+                probs = {k: max(0.01, min(0.99, v)) for k, v in probs.items()}
+                # Re-normalize after clamping
+                total = sum(probs.values())
+                if abs(total - 1.0) > 0.001:
+                    probs = {k: v / total for k, v in probs.items()}
         # else: non-mutually-exclusive — keep raw values, just clamped
 
         return probs
@@ -638,6 +641,7 @@ class EnsembleReasoner:
         self,
         results: List[Tuple[Dict[str, float], ReasoningTrace]],
         outcomes: List[str],
+        mutually_exclusive: bool = True,
     ) -> Tuple[Dict[str, float], ReasoningTrace]:
         """Aggregate using logit-space averaging (BLF method).
 
@@ -647,7 +651,7 @@ class EnsembleReasoner:
 
         Formula: avg_logit = mean(log(p/(1-p))), final_p = sigmoid(avg_logit)
         
-        For non-mutually-exclusive events (detected by raw prob sums > 1.3),
+        For non-mutually-exclusive events (mutually_exclusive=False),
         skips normalization so each outcome is scored independently.
         """
         import math
@@ -682,25 +686,15 @@ class EnsembleReasoner:
             # Convert back to probability
             aggregated_probs[outcome] = 1.0 / (1.0 + math.exp(-avg_logit))
 
-        # Detect mutually exclusive vs non-mutually-exclusive
-        # If models returned probs that sum well above 1.0, it's non-mutually-exclusive
-        # Check the raw model outputs to detect this
-        raw_sums = []
-        for probs, _ in results:
-            raw_sum = sum(probs.get(o, 0.0) for o in outcomes)
-            raw_sums.append(raw_sum)
-        avg_raw_sum = sum(raw_sums) / len(raw_sums) if raw_sums else 1.0
-
-        if avg_raw_sum <= 1.3:
-            # Mutually exclusive — normalize to sum to 1.0
+        # Only normalize for mutually exclusive events
+        if mutually_exclusive:
             total = sum(aggregated_probs.values())
             if total > 0:
                 aggregated_probs = {k: v / total for k, v in aggregated_probs.items()}
         else:
-            # Non-mutually-exclusive — keep independent probabilities
             logger.info(
-                f"Non-mutually-exclusive detected (avg raw sum={avg_raw_sum:.2f}), "
-                "skipping normalization"
+                f"Non-mutually-exclusive: skipping logit-avg normalization "
+                f"(raw sum={sum(aggregated_probs.values()):.2f})"
             )
 
         # Merge reasoning traces (same as before)
