@@ -973,6 +973,72 @@ async def get_costs() -> dict:
     return cost_tracker.get_summary()
 
 
+@app.get("/api-status")
+async def get_api_status() -> dict:
+    """Fetch real-time API balances from OpenRouter and Tavily.
+    
+    Returns actual remaining credits/balance from each service.
+    """
+    result = {
+        "openrouter": {"status": "unknown", "balance": None, "usage": None},
+        "tavily": {"status": "unknown", "credits_remaining": None},
+        "featherless": {"status": "unknown"},
+    }
+    
+    # Check OpenRouter balance via /api/v1/key
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                "https://openrouter.ai/api/v1/key",
+                headers={"Authorization": f"Bearer {config.anthropic_api_key}"},
+            )
+            if response.status_code == 200:
+                data = response.json()
+                key_data = data.get("data", {})
+                result["openrouter"] = {
+                    "status": "ok",
+                    "label": key_data.get("label", ""),
+                    "limit": key_data.get("limit"),
+                    "usage": key_data.get("usage"),
+                    "remaining": (
+                        round(key_data["limit"] - key_data["usage"], 4)
+                        if key_data.get("limit") is not None and key_data.get("usage") is not None
+                        else None
+                    ),
+                    "limit_remaining": key_data.get("limit_remaining"),
+                    "is_free_tier": key_data.get("is_free_tier", False),
+                    "rate_limit": key_data.get("rate_limit", {}),
+                }
+            else:
+                result["openrouter"]["status"] = f"error ({response.status_code})"
+    except Exception as e:
+        result["openrouter"]["status"] = f"error: {str(e)[:100]}"
+    
+    # Check Featherless connectivity
+    if config.featherless_api_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    "https://api.featherless.ai/v1/models",
+                    headers={"Authorization": f"Bearer {config.featherless_api_key}"},
+                )
+                if response.status_code == 200:
+                    result["featherless"]["status"] = "ok"
+                else:
+                    result["featherless"]["status"] = f"error ({response.status_code})"
+        except Exception as e:
+            result["featherless"]["status"] = f"error: {str(e)[:100]}"
+    
+    # Add internal cost tracking info
+    result["internal_tracking"] = {
+        "total_predictions": len(prediction_log),
+        "estimated_spend_usd": round(cost_tracker.total_spend, 4),
+        "budget_usd": cost_tracker.budget_usd,
+    }
+    
+    return result
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     """Serve the monitoring dashboard HTML page."""
