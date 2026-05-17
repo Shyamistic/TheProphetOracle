@@ -636,7 +636,11 @@ async def process_event_with_timeout(
 def build_prediction_response(
     probabilities: Dict[str, float],
 ) -> PredictionResponse:
-    """Convert a probabilities dict to a PredictionResponse."""
+    """Convert a probabilities dict to a PredictionResponse.
+    
+    Note: We do NOT force probabilities to sum to 1 here.
+    Prophet Arena scores as-is and outcomes may not be mutually exclusive.
+    """
     entries = [
         ProbabilityEntry(market=outcome, probability=round(prob, 4))
         for outcome, prob in probabilities.items()

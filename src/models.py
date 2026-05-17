@@ -65,7 +65,7 @@ class ProbabilityEntry(BaseModel):
     """A single outcome probability entry in the prediction response."""
 
     market: str
-    probability: float = Field(ge=0.01, le=0.99)
+    probability: float = Field(ge=0.0, le=1.0)
 
 
 class PredictionResponse(BaseModel):

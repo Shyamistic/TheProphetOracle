@@ -112,7 +112,8 @@ Close Time: {event.close_time}
 
 ## Critical Rules
 - Probabilities MUST be between 0.02 and 0.98 (never express near-certainty)
-- Probabilities MUST sum to exactly 1.0 across all outcomes
+- For mutually exclusive outcomes (e.g., "who wins"), probabilities should sum to approximately 1.0
+- For non-mutually-exclusive outcomes (e.g., "which of these will qualify/finish top K"), each probability is INDEPENDENT and they do NOT need to sum to 1.0 — each represents P(this outcome is in the winning set)
 - If market prices are available, use them as your starting prior — only deviate if evidence strongly justifies it
 - Be well-calibrated: when you say 70%, events should happen ~70% of the time
 
@@ -498,14 +499,13 @@ class EnsembleReasoner:
     def _normalize_probabilities(
         self, raw_probs: Dict[str, float], outcomes: List[str]
     ) -> Dict[str, float]:
-        """Normalize probabilities to valid range and sum to 1.0.
+        """Normalize probabilities to valid range.
 
-        Args:
-            raw_probs: Raw probability dict from LLM.
-            outcomes: Expected outcome labels.
-
-        Returns:
-            Normalized probability dict.
+        For mutually exclusive events: normalizes to sum to 1.0
+        For non-mutually-exclusive events: keeps raw values (each is independent)
+        
+        Detection: if raw probs sum to roughly 1.0 (within 0.3), treat as mutually exclusive.
+        If they sum to significantly more (e.g., 3.0 for a top-5 event), keep as-is.
         """
         probs: Dict[str, float] = {}
 
@@ -519,21 +519,20 @@ class EnsembleReasoner:
             p = max(0.01, min(0.99, p))
             probs[outcome] = p
 
-        # Normalize to sum to 1.0
+        # Detect if mutually exclusive: raw sum near 1.0
         total = sum(probs.values())
-        if total > 0:
+        n = len(outcomes)
+        
+        if total > 0 and abs(total - 1.0) < 0.3:
+            # Looks mutually exclusive — normalize to sum to 1.0
             probs = {k: v / total for k, v in probs.items()}
-        else:
-            n = len(outcomes)
-            probs = {o: 1.0 / n for o in outcomes}
-
-        # Final clamp after normalization
-        probs = {k: max(0.01, min(0.99, v)) for k, v in probs.items()}
-
-        # Re-normalize after clamping
-        total = sum(probs.values())
-        if abs(total - 1.0) > 0.001:
-            probs = {k: v / total for k, v in probs.items()}
+            # Final clamp after normalization
+            probs = {k: max(0.01, min(0.99, v)) for k, v in probs.items()}
+            # Re-normalize after clamping
+            total = sum(probs.values())
+            if abs(total - 1.0) > 0.001:
+                probs = {k: v / total for k, v in probs.items()}
+        # else: non-mutually-exclusive — keep raw values, just clamped
 
         return probs
 
