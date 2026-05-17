@@ -1,0 +1,20 @@
+# Prophet Forecasting Agent - Docker Compose Configuration
+# Single-command deployment: docker compose up
+
+services:
+  prophet-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: prophet-forecasting-agent
+    env_file:
+      - .env
+    ports:
+      - "${PROPHET_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped

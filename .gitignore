@@ -1,0 +1,58 @@
+# Environment & Secrets
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+*.cover
+
+# Database files (generated at runtime)
+*.db
+cache.db
+cost_tracker.db
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Kiro specs (development only)
+.kiro/
+
+# Backtest results (large JSON files)
+backtest/results/*.json
+
+# Temporary test files
+test_single_task.py
+test_ensemble.py
+test_serper.py
+test_arena_format.py
+check_models.py
+fetch_datasets.py
+
+# Research docs (not needed in production)
+research/
