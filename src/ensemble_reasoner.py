@@ -98,6 +98,8 @@ Close Time: {event.close_time}
 
 ## Your Analysis (follow these steps):
 
+0. RESOLUTION ANALYSIS: Read the rules carefully. What EXACTLY needs to happen for each outcome to resolve? Are there edge cases, technicalities, or ambiguities in the resolution criteria? Consider: timing requirements, what counts vs doesn't count, who determines the outcome, and whether partial fulfillment qualifies.
+
 1. BASE RATES: What are the historical base rates for this type of event? How often do similar things happen?
 
 2. CURRENT STATE: What is the current state of the world relevant to this question?
@@ -656,6 +658,15 @@ class EnsembleReasoner:
                 p = max(0.01, min(0.99, p))
                 probs_per_outcome[outcome].append(p)
 
+        # Adaptive shrinkage: more shrinkage when models disagree
+        spread = max(max(probs) - min(probs) for probs in probs_per_outcome.values())
+        if spread > 0.20:
+            shrinkage = 0.85  # 15% shrinkage — models very uncertain
+        elif spread > 0.10:
+            shrinkage = 0.90  # 10% shrinkage — moderate disagreement
+        else:
+            shrinkage = 0.95  # 5% shrinkage — models agree (default)
+
         # Logit-space averaging for each outcome
         aggregated_probs: Dict[str, float] = {}
         for outcome in outcomes:
@@ -663,8 +674,7 @@ class EnsembleReasoner:
             # Convert to logits, average, convert back
             logits = [math.log(p / (1.0 - p)) for p in values]
             avg_logit = sum(logits) / len(logits)
-            # Apply shrinkage toward 0 (slight pull toward 0.5) for robustness
-            shrinkage = 0.95  # 5% shrinkage toward prior
+            # Apply shrinkage toward 0 (pull toward 0.5) for robustness
             avg_logit = avg_logit * shrinkage
             # Convert back to probability
             aggregated_probs[outcome] = 1.0 / (1.0 + math.exp(-avg_logit))

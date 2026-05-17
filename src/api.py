@@ -83,8 +83,8 @@ def get_adaptive_anchor_weight(close_time_str: str, base_weight: float = 0.3) ->
 
 
 CATEGORY_ANCHOR_MULTIPLIER = {
-    "sports": 1.5,        # Anchor MORE to market (sports bettors are sharp)
-    "entertainment": 1.3,  # Anchor more (we have no edge on reality TV)
+    "sports": 2.0,        # Anchor VERY heavily to market (sports bettors are sharp, we can't beat them)
+    "entertainment": 1.5,  # Anchor heavily (we have no edge on reality TV/awards)
     "economics": 0.8,      # Trust our research more
     "geopolitics": 0.7,    # Trust our research more (markets often slow on geopolitics)
     "technology": 0.9,     # Balanced
@@ -487,6 +487,42 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
                     logger.info(f"Found {len(counter_summaries)} counter-evidence items")
         except Exception as e:
             logger.debug(f"Counter-evidence search failed: {e}")
+
+    # Step 5.7: Iterative research for moderate confidence (BLF-inspired)
+    # If prediction is moderate (40-70% for top outcome), do a second targeted search
+    # to gather more evidence before finalizing
+    top_outcome = max(aggregated, key=aggregated.get)
+    top_prob = aggregated[top_outcome]
+
+    if 0.40 <= top_prob <= 0.70 and search_client:
+        elapsed = time.time() - start_time
+        if elapsed < 120:  # Only if we have time (< 2 min elapsed)
+            logger.info(
+                f"Moderate confidence ({top_outcome}: {top_prob:.1%}) for {event.event_ticker}, "
+                "doing iterative research pass"
+            )
+            try:
+                # Search with more specific query based on what we know
+                iterative_query = f"{event.title} latest update prediction odds forecast"
+                iterative_results = search_client.search(
+                    iterative_query,
+                    max_results=3,
+                    topic="news",
+                    time_range="week",
+                )
+                iter_items = iterative_results.get("results", [])
+                if iter_items:
+                    iter_summaries = [
+                        item.get("content", "")[:200] for item in iter_items[:3] if item.get("content")
+                    ]
+                    if iter_summaries:
+                        supplementary_evidence += (
+                            " [ITERATIVE RESEARCH for moderate confidence]: "
+                            + " | ".join(iter_summaries)
+                        )
+                        logger.info(f"Iterative research found {len(iter_summaries)} items")
+            except Exception as e:
+                logger.debug(f"Iterative research failed: {e}")
 
     # Step 6: Supervisor reconciliation (if market stats available)
     if market_stats:
