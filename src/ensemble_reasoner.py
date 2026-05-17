@@ -32,6 +32,25 @@ logger = logging.getLogger(__name__)
 MODEL_CALL_TIMEOUT = 60
 
 
+def _get_category_base_rates(category: str, outcomes: List[str]) -> str:
+    """Provide category-specific base rate guidance for the LLM."""
+    cat = category.lower() if category else "general"
+    n = len(outcomes)
+
+    if n == 2:  # Binary events
+        guidance = {
+            "sports": "For head-to-head sports matchups, the favorite wins ~60-65% of the time. Home advantage adds ~5%.",
+            "economics": "For economic policy questions (rate cuts, etc.), the status quo (no change) occurs ~65% of the time. Markets tend toward stability.",
+            "geopolitics": "For political events, incumbents/favorites win ~60% of the time. Dramatic changes are less common than continuity.",
+            "technology": "For product launch/milestone questions, announced products ship ~75% of the time. Delays are common but cancellations are rare.",
+            "science": "For space/science mission questions, scheduled missions launch on time ~40% of the time. Delays are very common.",
+            "entertainment": "For entertainment outcomes, favorites/frontrunners win ~50% of the time. These are genuinely unpredictable.",
+        }
+        return f"\n## Base Rate Guidance\n{guidance.get(cat, 'No specific base rate available for this category.')}\n"
+    else:
+        return f"\n## Base Rate Guidance\nWith {n} outcomes, the uniform base rate is {100/n:.1f}% per outcome. Favorites typically have 2-3x the base rate.\n"
+
+
 def build_structured_prompt(
     event: EventRequest,
     research: ResearchResult,
@@ -56,6 +75,9 @@ def build_structured_prompt(
     # Format market info
     market_text = _format_market_info(market_stats)
 
+    # Add category-specific base rate guidance
+    base_rate_text = _get_category_base_rates(event.category, event.outcomes)
+
     # Format outcomes
     outcomes_str = ", ".join(f'"{o}"' for o in event.outcomes)
     outcome_1 = event.outcomes[0] if event.outcomes else "Yes"
@@ -70,6 +92,7 @@ Rules: {event.rules}
 Outcomes: [{outcomes_str}]
 Close Time: {event.close_time}
 {market_text}
+{base_rate_text}
 ## Research Evidence
 {evidence_text}
 
@@ -304,14 +327,14 @@ class EnsembleReasoner:
                 had_disagreement = True
                 logger.info("Ensemble: models disagree >15% (no tiebreaker available)")
 
-            # Take median across all successful results
-            probs, trace = self._aggregate_median(successful_results, event.outcomes)
+            # Aggregate using logit-space averaging (BLF method)
+            probs, trace = self._aggregate_logit_average(successful_results, event.outcomes)
 
             # Log the spread
             spread_info = self._compute_spread(successful_results, event.outcomes)
             logger.info(
                 f"Ensemble: {len(successful_results)} models succeeded, "
-                f"median probabilities: {{{', '.join(f'{k}: {v:.3f}' for k, v in probs.items())}}}, "
+                f"logit-avg probabilities: {{{', '.join(f'{k}: {v:.3f}' for k, v in probs.items())}}}, "
                 f"max spread: {spread_info:.3f}"
             )
 
@@ -609,6 +632,69 @@ class EnsembleReasoner:
         )
 
         return median_probs, merged_trace
+
+    def _aggregate_logit_average(
+        self,
+        results: List[Tuple[Dict[str, float], ReasoningTrace]],
+        outcomes: List[str],
+    ) -> Tuple[Dict[str, float], ReasoningTrace]:
+        """Aggregate using logit-space averaging (BLF method).
+
+        Instead of taking the median in probability space, converts to log-odds,
+        averages in that space, then converts back. This properly handles extreme
+        probabilities and is the state-of-the-art aggregation method.
+
+        Formula: avg_logit = mean(log(p/(1-p))), final_p = sigmoid(avg_logit)
+        """
+        import math
+
+        # Collect probabilities per outcome
+        probs_per_outcome: Dict[str, List[float]] = {o: [] for o in outcomes}
+        for probs, _ in results:
+            for outcome in outcomes:
+                p = probs.get(outcome, 1.0 / len(outcomes))
+                # Clamp to avoid log(0) or log(inf)
+                p = max(0.01, min(0.99, p))
+                probs_per_outcome[outcome].append(p)
+
+        # Logit-space averaging for each outcome
+        aggregated_probs: Dict[str, float] = {}
+        for outcome in outcomes:
+            values = probs_per_outcome[outcome]
+            # Convert to logits, average, convert back
+            logits = [math.log(p / (1.0 - p)) for p in values]
+            avg_logit = sum(logits) / len(logits)
+            # Apply shrinkage toward 0 (slight pull toward 0.5) for robustness
+            shrinkage = 0.95  # 5% shrinkage toward prior
+            avg_logit = avg_logit * shrinkage
+            # Convert back to probability
+            aggregated_probs[outcome] = 1.0 / (1.0 + math.exp(-avg_logit))
+
+        # Normalize to sum to 1.0
+        total = sum(aggregated_probs.values())
+        if total > 0:
+            aggregated_probs = {k: v / total for k, v in aggregated_probs.items()}
+
+        # Merge reasoning traces (same as before)
+        all_evidence = []
+        all_supporting = []
+        all_conflicting = []
+        for _, trace in results:
+            all_evidence.extend(trace.evidence_considered)
+            all_supporting.extend(trace.supporting_factors)
+            all_conflicting.extend(trace.conflicting_evidence)
+
+        base_trace = results[0][1]
+        merged_trace = ReasoningTrace(
+            evidence_considered=list(set(all_evidence))[:10],
+            base_rate=base_trace.base_rate,
+            supporting_factors=list(set(all_supporting))[:5],
+            conflicting_evidence=list(set(all_conflicting))[:5],
+            conflict_resolution=f"Logit-space average of {len(results)} models (BLF method). {base_trace.conflict_resolution}",
+            confidence_level=base_trace.confidence_level,
+        )
+
+        return aggregated_probs, merged_trace
 
     def _fallback_prediction(
         self, event: EventRequest, duration: float

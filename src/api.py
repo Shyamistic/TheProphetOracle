@@ -455,6 +455,39 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
         except Exception as e:
             logger.debug(f"Supplementary search failed for {event.event_ticker}: {e}")
 
+    # Step 5.6: Iterative counter-evidence research (BLF-inspired)
+    # If the leading prediction is strong (>70%), search for counter-evidence
+    # to avoid confirmation bias
+    top_outcome = max(aggregated, key=aggregated.get)
+    top_prob = aggregated[top_outcome]
+
+    if top_prob > 0.70 and search_client:
+        logger.info(
+            f"Strong prediction ({top_outcome}: {top_prob:.1%}) for {event.event_ticker}, "
+            "searching for counter-evidence to debias"
+        )
+        try:
+            counter_query = f"{event.title} why {top_outcome} might NOT happen unlikely"
+            counter_results = search_client.search(
+                counter_query,
+                max_results=2,
+                topic="news",
+                time_range="month",
+            )
+            counter_items = counter_results.get("results", [])
+            if counter_items:
+                counter_summaries = [
+                    item.get("content", "")[:200] for item in counter_items[:2] if item.get("content")
+                ]
+                if counter_summaries:
+                    supplementary_evidence += (
+                        " [COUNTER-EVIDENCE to debias strong prediction]: "
+                        + " | ".join(counter_summaries)
+                    )
+                    logger.info(f"Found {len(counter_summaries)} counter-evidence items")
+        except Exception as e:
+            logger.debug(f"Counter-evidence search failed: {e}")
+
     # Step 6: Supervisor reconciliation (if market stats available)
     if market_stats:
         evidence_summary = _build_evidence_summary(research_results)
