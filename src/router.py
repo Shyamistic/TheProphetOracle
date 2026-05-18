@@ -57,6 +57,15 @@ CATEGORY_STRATEGIES: Dict[EventCategory, Dict[str, List[str]]] = {
         ],
         "preferred_sources": ["nature.com", "science.org", "arxiv.org"],
     },
+    EventCategory.ENTERTAINMENT: {
+        "source_types": ["entertainment_news", "charts", "betting_odds"],
+        "query_templates": [
+            "{title_keywords} latest news {year}",
+            "{topic} odds prediction betting",
+            "{topic} chart ranking standings",
+        ],
+        "preferred_sources": ["billboard.com", "variety.com", "spotify.com"],
+    },
     EventCategory.GENERAL: {
         "source_types": ["general_news"],
         "query_templates": [
@@ -77,10 +86,11 @@ _COMPLEXITY_RESOURCES = {
 
 
 def detect_category(category_str: str) -> EventCategory:
-    """Case-insensitive category matching with fallback to GENERAL.
+    """Case-insensitive category matching with keyword-based fallback.
 
-    Matches the input string against known EventCategory values. If no match
-    is found, returns EventCategory.GENERAL as the default fallback.
+    First tries exact match against known EventCategory values.
+    Then tries keyword-based detection from the category string.
+    Falls back to GENERAL if nothing matches.
 
     Args:
         category_str: The category string from the event request.
@@ -89,9 +99,26 @@ def detect_category(category_str: str) -> EventCategory:
         The matched EventCategory enum value, or GENERAL if unrecognized.
     """
     normalized = category_str.strip().lower()
+    
+    # Direct match
     for cat in EventCategory:
         if cat.value == normalized:
             return cat
+    
+    # Keyword-based fallback for common variations
+    keyword_map = {
+        EventCategory.SPORTS: ["sport", "nba", "nfl", "mlb", "soccer", "football", "tennis", "cricket", "baseball", "basketball", "hockey", "mma", "ufc", "boxing", "golf", "f1", "racing"],
+        EventCategory.ECONOMICS: ["econom", "finance", "market", "stock", "crypto", "bitcoin", "inflation", "gdp", "trade", "fed", "interest rate", "price", "gas price"],
+        EventCategory.GEOPOLITICS: ["politic", "geopolitic", "election", "government", "war", "military", "diplomat", "sanction", "trump", "biden", "congress", "senate", "legislation"],
+        EventCategory.TECHNOLOGY: ["tech", "ai", "software", "hardware", "startup", "silicon", "computing", "cyber", "digital", "app", "platform"],
+        EventCategory.SCIENCE: ["science", "space", "nasa", "spacex", "climate", "medical", "health", "pharma", "research", "biology", "physics", "who"],
+        EventCategory.ENTERTAINMENT: ["entertain", "music", "movie", "film", "tv", "show", "celebrity", "spotify", "netflix", "award", "grammy", "oscar", "eurovision", "concert", "album", "song"],
+    }
+    
+    for cat, keywords in keyword_map.items():
+        if any(kw in normalized for kw in keywords):
+            return cat
+    
     return EventCategory.GENERAL
 
 

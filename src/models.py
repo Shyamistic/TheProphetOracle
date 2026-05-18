@@ -19,6 +19,7 @@ class EventCategory(str, Enum):
     GEOPOLITICS = "geopolitics"
     TECHNOLOGY = "technology"
     SCIENCE = "science"
+    ENTERTAINMENT = "entertainment"
     GENERAL = "general"
 
 

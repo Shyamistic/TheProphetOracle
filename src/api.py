@@ -28,14 +28,17 @@ from src.market_data import get_market_prices
 from src.models import (
     ComplexityTier,
     ErrorResponse,
+    EvidenceItem,
+    EventCategory,
     EventRequest,
     PredictionResponse,
     ProbabilityEntry,
+    ResearchResult,
     RoutingConfig,
 )
 from src.reasoner import ReasoningEngine
 from src.research import run_parallel_research
-from src.router import classify_event
+from src.router import classify_event, detect_category
 from src.search_client import SearchClient
 from src.dashboard import get_dashboard_html
 from src.supervisor import SupervisorAgent
@@ -411,6 +414,23 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
     # Step 1: Route (classify category and complexity)
     routing_config = classify_event(event)
 
+    # If category is GENERAL, try to detect from title keywords
+    if routing_config.category == EventCategory.GENERAL:
+        title_category = detect_category(event.title)
+        if title_category != EventCategory.GENERAL:
+            logger.info(
+                f"Title-based category override for {event.event_ticker}: "
+                f"GENERAL -> {title_category.value}"
+            )
+            routing_config = RoutingConfig(
+                category=title_category,
+                complexity=routing_config.complexity,
+                num_agents=routing_config.num_agents,
+                max_searches=routing_config.max_searches,
+                max_llm_calls=routing_config.max_llm_calls,
+                search_strategies=routing_config.search_strategies,
+            )
+
     # Detect non-mutually-exclusive events (top-K style)
     mutually_exclusive = not is_non_mutually_exclusive(
         event.title, event.description, event.outcomes
@@ -594,6 +614,59 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
             except Exception as e:
                 logger.debug(f"Iterative research failed: {e}")
 
+    # Step 5.8: Second ensemble pass for highly uncertain events
+    # If top probability is in the "coin flip" zone (35-65%) AND we have supplementary evidence,
+    # re-run the ensemble with enriched context for a more informed prediction
+    top_outcome_2 = max(aggregated, key=aggregated.get)
+    top_prob_2 = aggregated[top_outcome_2]
+    
+    if 0.35 <= top_prob_2 <= 0.65 and supplementary_evidence and search_client:
+        elapsed = time.time() - start_time
+        if elapsed < 300:  # Only if we have time (< 5 min elapsed)
+            logger.info(
+                f"Highly uncertain ({top_outcome_2}: {top_prob_2:.1%}) for {event.event_ticker}, "
+                "running second ensemble pass with enriched evidence"
+            )
+            # Create an enriched research result with supplementary evidence
+            enriched_evidence = []
+            if research_results:
+                enriched_evidence = list(research_results[0].evidence)
+            # Add a synthetic evidence item with supplementary findings
+            if supplementary_evidence:
+                enriched_evidence.append(EvidenceItem(
+                    source_url="internal://supplementary-research",
+                    summary=supplementary_evidence[:500],
+                    relevance_score=0.9,
+                    publication_date=None,
+                    corroborated=True,
+                ))
+            enriched_research = ResearchResult(
+                event_ticker=event.event_ticker,
+                evidence=enriched_evidence,
+                search_queries_used=[event.title],
+                failed_sources=[],
+                duration_seconds=0.0,
+            )
+            
+            # Run second ensemble pass
+            try:
+                second_prediction = await ensemble_reasoner.predict(
+                    event, enriched_research, market_stats=market_stats,
+                    mutually_exclusive=mutually_exclusive,
+                )
+                # Blend: 60% second pass (more informed), 40% first pass
+                for outcome in event.outcomes:
+                    first_p = aggregated.get(outcome, 0.5)
+                    second_p = second_prediction.probabilities.get(outcome, 0.5)
+                    aggregated[outcome] = 0.4 * first_p + 0.6 * second_p
+                
+                logger.info(
+                    f"Second ensemble pass complete for {event.event_ticker}, "
+                    f"blended prediction: {{{', '.join(f'{k}: {v:.3f}' for k, v in aggregated.items())}}}"
+                )
+            except Exception as e:
+                logger.warning(f"Second ensemble pass failed for {event.event_ticker}: {e}")
+
     # Step 6: Supervisor reconciliation (if market stats available)
     if market_stats:
         evidence_summary = _build_evidence_summary(research_results)
@@ -689,6 +762,27 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
     # Keep log bounded to last 200 entries
     if len(prediction_log) > 200:
         prediction_log[:] = prediction_log[-200:]
+
+    # Persist to JSONL file for post-hoc analysis
+    import json as _json
+    log_entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event_ticker": event.event_ticker,
+        "title": event.title,
+        "category": routing_config.category.value,
+        "outcomes": event.outcomes,
+        "probabilities": {k: round(v, 4) for k, v in calibrated.items()},
+        "duration": round(time.time() - start_time, 1),
+        "had_disagreement": any(
+            getattr(pr, "had_disagreement", False) for pr in prediction_results
+        ) if prediction_results else False,
+        "mutually_exclusive": mutually_exclusive,
+    }
+    try:
+        with open("predictions_log.jsonl", "a") as f:
+            f.write(_json.dumps(log_entry) + "\n")
+    except Exception:
+        pass  # Don't let logging failures break predictions
 
     return calibrated
 
