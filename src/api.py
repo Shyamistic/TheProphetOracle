@@ -1025,32 +1025,11 @@ async def health_check() -> dict:
         status["checks"]["llm_api"] = f"error: {str(e)}"
         status["status"] = "unhealthy"
 
-    # Check Tavily API connectivity
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            # Tavily doesn't have a simple health endpoint, so we check
-            # that we can reach their API
-            response = await client.post(
-                "https://api.tavily.com/search",
-                json={
-                    "api_key": config.tavily_api_key,
-                    "query": "test",
-                    "max_results": 1,
-                },
-                timeout=10.0,
-            )
-            if response.status_code == 200:
-                status["checks"]["search_api"] = "ok"
-            elif response.status_code == 401:
-                status["checks"]["search_api"] = "error: invalid API key"
-                status["status"] = "unhealthy"
-            else:
-                status["checks"]["search_api"] = (
-                    f"degraded (status {response.status_code})"
-                )
-                status["status"] = "degraded"
-    except Exception as e:
-        status["checks"]["search_api"] = f"error: {str(e)}"
+    # Check Tavily API connectivity (just verify key is configured, don't make a real search)
+    if config.tavily_api_key and len(config.tavily_api_key) > 10:
+        status["checks"]["search_api"] = "ok"
+    else:
+        status["checks"]["search_api"] = "error: no API key configured"
         status["status"] = "unhealthy"
 
     # Add cost info
