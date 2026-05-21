@@ -10,6 +10,7 @@ Key insight from hackathon organizer: "Only make prediction when you are confide
 enough, otherwise just use the market probability as your prediction."
 """
 
+import re
 import httpx
 import logging
 from typing import Dict, List, Optional
@@ -24,6 +25,7 @@ async def fetch_kalshi_market_price(market_ticker: str) -> Optional[Dict[str, fl
     """Fetch current market prices from Kalshi's public API.
 
     No authentication required. Returns outcome -> probability mapping.
+    Handles both dollar-denominated and cent-denominated price fields.
 
     Args:
         market_ticker: The Kalshi market ticker (e.g., "KXHIGHNY-24JAN01-T60")
@@ -43,17 +45,31 @@ async def fetch_kalshi_market_price(market_ticker: str) -> Optional[Dict[str, fl
                 data = response.json()
                 market = data.get("market", {})
 
-                # Kalshi returns prices in cents (0-100 scale)
+                # Try dollar-denominated price first (string like "0.7200")
+                last_price_dollars = market.get("last_price_dollars")
+                if last_price_dollars and last_price_dollars != "0.0000":
+                    try:
+                        yes_prob = float(last_price_dollars)
+                        if 0.0 < yes_prob < 1.0:
+                            return {"Yes": yes_prob, "No": 1.0 - yes_prob}
+                    except (ValueError, TypeError):
+                        pass
+
+                # Fallback to cent-denominated (integer 0-100)
                 yes_price = market.get("last_price")
-                if yes_price is not None:
+                if yes_price is not None and yes_price > 0:
                     yes_prob = yes_price / 100.0
                     return {"Yes": yes_prob, "No": 1.0 - yes_prob}
 
-                # Try yes_ask/no_ask as fallback
-                yes_ask = market.get("yes_ask")
-                if yes_ask is not None:
-                    yes_prob = yes_ask / 100.0
-                    return {"Yes": yes_prob, "No": 1.0 - yes_prob}
+                # Try yes_ask as fallback
+                yes_ask = market.get("yes_ask_dollars")
+                if yes_ask and yes_ask != "0.0000":
+                    try:
+                        yes_prob = float(yes_ask)
+                        if 0.0 < yes_prob < 1.0:
+                            return {"Yes": yes_prob, "No": 1.0 - yes_prob}
+                    except (ValueError, TypeError):
+                        pass
 
             logger.debug(
                 f"Kalshi API returned status {response.status_code} for {market_ticker}"
@@ -71,11 +87,15 @@ async def fetch_kalshi_market_price(market_ticker: str) -> Optional[Dict[str, fl
 async def fetch_kalshi_event_markets(event_ticker: str) -> Optional[Dict[str, float]]:
     """Fetch market prices for all markets in a Kalshi event.
 
-    Useful when the event has multiple outcomes (not just Yes/No).
-    Uses the /events/{event_ticker} endpoint which returns nested markets.
+    Uses the /events/{event_ticker} endpoint with nested markets.
+    Handles both dollar-denominated prices (last_price_dollars) and
+    cent-denominated prices (last_price).
+    
+    For threshold events (gas prices, TSA, etc.), uses yes_sub_title
+    as the outcome label.
 
     Args:
-        event_ticker: The Kalshi event ticker (e.g., "KXHIGHNY")
+        event_ticker: The Kalshi event ticker (e.g., "KXAAAGASD-26MAY21")
 
     Returns:
         Dict mapping outcome labels to market prices (0-1 scale), or None if fetch fails.
@@ -84,10 +104,10 @@ async def fetch_kalshi_event_markets(event_ticker: str) -> Optional[Dict[str, fl
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.get(
                 f"{KALSHI_BASE_URL}/events/{event_ticker}",
-                params={"with_nested_markets": True},
+                params={"with_nested_markets": "true"},
             )
             if response.status_code == 200:
                 data = response.json()
@@ -99,14 +119,84 @@ async def fetch_kalshi_event_markets(event_ticker: str) -> Optional[Dict[str, fl
 
                 prices = {}
                 for mkt in markets:
-                    # Use subtitle or title as outcome label
-                    label = mkt.get("subtitle") or mkt.get("title", "")
-                    last_price = mkt.get("last_price")
-                    if label and last_price is not None:
-                        prices[label] = last_price / 100.0
+                    # Skip settled/closed markets with no useful price
+                    status = mkt.get("status", "")
+                    
+                    # Get the label — try yes_sub_title first (most reliable for threshold events)
+                    label = (
+                        mkt.get("yes_sub_title") or 
+                        mkt.get("subtitle") or 
+                        mkt.get("title") or 
+                        ""
+                    )
+                    
+                    # If no label, extract from ticker (e.g., KXAAAGASD-26MAY21-4.560 → "Above 4.560")
+                    if not label:
+                        ticker = mkt.get("ticker", "")
+                        parts = ticker.split("-")
+                        if len(parts) >= 3:
+                            threshold_part = parts[-1]
+                            try:
+                                float(threshold_part)
+                                label = f"Above {threshold_part}"
+                            except ValueError:
+                                pass
+                    
+                    if not label:
+                        continue
+                    
+                    # Get price — try multiple fields
+                    # Priority: last_price_dollars > last_price (cents) > yes_bid_dollars
+                    price = None
+                    
+                    # Dollar-denominated (string like "0.9800")
+                    last_price_dollars = mkt.get("last_price_dollars")
+                    if last_price_dollars and last_price_dollars != "0.0000":
+                        try:
+                            price = float(last_price_dollars)
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    # Cent-denominated (integer like 98)
+                    if price is None:
+                        last_price_cents = mkt.get("last_price")
+                        if last_price_cents is not None and last_price_cents > 0:
+                            try:
+                                price = int(last_price_cents) / 100.0
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    # Fallback to yes_bid_dollars
+                    if price is None:
+                        yes_bid = mkt.get("yes_bid_dollars")
+                        if yes_bid and yes_bid != "0.0000":
+                            try:
+                                price = float(yes_bid)
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    # For closed/settled markets, check result
+                    if price is None and status == "closed":
+                        result = mkt.get("result", "")
+                        if result == "yes":
+                            price = 0.99
+                        elif result == "no":
+                            price = 0.01
+                    
+                    if label and price is not None and 0.0 <= price <= 1.0:
+                        prices[label] = price
 
+                if prices:
+                    logger.info(
+                        f"Kalshi event {event_ticker}: fetched {len(prices)} market prices "
+                        f"(sample: {list(prices.items())[:3]})"
+                    )
                 return prices if prices else None
 
+            elif response.status_code == 404:
+                logger.debug(f"Kalshi event {event_ticker} not found (404)")
+            else:
+                logger.debug(f"Kalshi API returned {response.status_code} for event {event_ticker}")
             return None
 
     except httpx.TimeoutException:
@@ -327,24 +417,87 @@ def _match_outcomes(
     prices: Dict[str, float], outcomes: List[str]
 ) -> Optional[Dict[str, float]]:
     """Try to match fetched market labels to expected outcome labels.
-
-    Uses case-insensitive substring matching as a fallback.
+    
+    Handles multiple matching strategies:
+    1. Exact match
+    2. Case-insensitive match
+    3. Numeric threshold extraction and matching
+    4. Substring matching
     """
     # Exact match
     if set(prices.keys()) == set(outcomes):
         return prices
 
     # Case-insensitive exact match
-    prices_lower = {k.lower(): v for k, v in prices.items()}
+    prices_lower = {k.lower(): (k, v) for k, v in prices.items()}
     matched = {}
     for outcome in outcomes:
         if outcome.lower() in prices_lower:
-            matched[outcome] = prices_lower[outcome.lower()]
-
+            matched[outcome] = prices_lower[outcome.lower()][1]
     if len(matched) == len(outcomes):
         return matched
 
-    # Substring match (e.g., "Pittsburgh Steelers" matches "Pittsburgh")
+    # Numeric threshold extraction matching
+    # Extract numbers from both price labels and outcomes, match by number
+    def extract_number(s):
+        """Extract the primary number from a string."""
+        # Remove currency symbols and commas
+        cleaned = s.replace("$", "").replace(",", "")
+        numbers = re.findall(r'[\d.]+', cleaned)
+        if numbers:
+            try:
+                return float(numbers[0])
+            except ValueError:
+                pass
+        return None
+    
+    # Build a map of number -> price from Kalshi data
+    number_to_price = {}
+    for label, price in prices.items():
+        num = extract_number(label)
+        if num is not None:
+            number_to_price[num] = price
+    
+    # Try to match outcomes by their numeric value
+    if number_to_price:
+        matched = {}
+        for outcome in outcomes:
+            num = extract_number(outcome)
+            if num is not None and num in number_to_price:
+                matched[outcome] = number_to_price[num]
+            elif num is not None:
+                # Try close match (within 0.001 for floating point)
+                for k_num, k_price in number_to_price.items():
+                    if abs(k_num - num) < 0.001:
+                        matched[outcome] = k_price
+                        break
+        
+        if len(matched) >= len(outcomes) * 0.6:  # At least 60% matched
+            # Fill unmatched with interpolation
+            matched_nums = sorted([(extract_number(o), matched[o]) for o in matched], key=lambda x: x[0])
+            for outcome in outcomes:
+                if outcome not in matched:
+                    num = extract_number(outcome)
+                    if num is not None and matched_nums:
+                        # Linear interpolation from nearest matched values
+                        below = [(n, p) for n, p in matched_nums if n <= num]
+                        above = [(n, p) for n, p in matched_nums if n >= num]
+                        if below and above:
+                            n1, p1 = below[-1]
+                            n2, p2 = above[0]
+                            if n2 != n1:
+                                matched[outcome] = p1 + (p2 - p1) * (num - n1) / (n2 - n1)
+                            else:
+                                matched[outcome] = p1
+                        elif below:
+                            matched[outcome] = below[-1][1]
+                        elif above:
+                            matched[outcome] = above[0][1]
+            
+            if len(matched) == len(outcomes):
+                return matched
+
+    # Substring match (fallback)
     matched = {}
     for outcome in outcomes:
         for label, price in prices.items():
@@ -354,7 +507,6 @@ def _match_outcomes(
             ):
                 matched[outcome] = price
                 break
-
     if len(matched) == len(outcomes):
         return matched
 

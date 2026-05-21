@@ -7,6 +7,8 @@ Supports both the internal format and Prophet Arena's input format.
 
 import asyncio
 import logging
+import math
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -94,6 +96,152 @@ CATEGORY_ANCHOR_MULTIPLIER = {
     "science": 0.9,        # Balanced
     "general": 1.0,        # Default
 }
+
+
+# --- Threshold Correction (Post-Calibration) ---
+
+
+def detect_threshold_outcomes(outcomes: List[str]) -> Optional[dict]:
+    """Detect if outcomes follow a threshold pattern (Above X, At least X, etc.)
+    
+    Returns dict with:
+        - direction: "above" or "below"
+        - thresholds: list of (outcome_label, numeric_value) sorted by value
+    Or None if not a threshold pattern.
+    """
+    # Patterns to match
+    patterns = [
+        (r'^[Aa]bove\s+([\d,.]+)', "above"),
+        (r'^[Aa]t\s+least\s+([\d,.]+)', "above"),
+        (r'^[Gg]reater\s+than\s+([\d,.]+)', "above"),
+        (r'^>\s*([\d,.]+)', "above"),
+        (r'^>=\s*([\d,.]+)', "above"),
+        (r'^[Bb]elow\s+([\d,.]+)', "below"),
+        (r'^[Ll]ess\s+than\s+([\d,.]+)', "below"),
+        (r'^<\s*([\d,.]+)', "below"),
+        (r'^<=\s*([\d,.]+)', "below"),
+    ]
+    
+    matched = []
+    direction = None
+    
+    for outcome in outcomes:
+        found = False
+        for pattern, dir_type in patterns:
+            m = re.match(pattern, outcome.strip())
+            if m:
+                try:
+                    value = float(m.group(1).replace(",", ""))
+                    matched.append((outcome, value))
+                    if direction is None:
+                        direction = dir_type
+                    elif direction != dir_type:
+                        return None  # Mixed directions, not a threshold pattern
+                    found = True
+                    break
+                except ValueError:
+                    continue
+        if not found:
+            return None  # Not all outcomes match threshold pattern
+    
+    if len(matched) < 3:  # Need at least 3 thresholds to be meaningful
+        return None
+    
+    # Sort by threshold value
+    matched.sort(key=lambda x: x[1])
+    
+    return {"direction": direction, "thresholds": matched}
+
+
+def apply_threshold_correction(
+    probabilities: Dict[str, float],
+    outcomes: List[str],
+    event_title: str,
+) -> Dict[str, float]:
+    """Apply monotonic correction for threshold-type events.
+    
+    Detects "Above X" / "At least X" patterns and ensures probabilities
+    are monotonically decreasing (higher threshold = lower probability).
+    
+    Uses the ensemble's raw probabilities to estimate the "center" value,
+    then builds a logistic cumulative distribution around it.
+    """
+    threshold_info = detect_threshold_outcomes(outcomes)
+    if threshold_info is None:
+        return probabilities  # Not a threshold event, return unchanged
+    
+    direction = threshold_info["direction"]
+    thresholds = threshold_info["thresholds"]  # sorted by value
+    
+    # Find the "center" — estimate where the actual value likely is
+    # Strategy: use the median threshold as default center, but adjust if
+    # the ensemble gives a clear signal (one outcome much higher than others)
+    n = len(thresholds)
+    
+    # Default: use median threshold as center
+    median_idx = n // 2
+    center_value = thresholds[median_idx][1]
+    
+    # Check if ensemble gives a signal — find the outcome with highest probability
+    max_prob = 0.0
+    max_prob_idx = median_idx
+    for i, (label, value) in enumerate(thresholds):
+        p = probabilities.get(label, 0.0)
+        if p > max_prob:
+            max_prob = p
+            max_prob_idx = i
+    
+    # If the highest-probability outcome is significantly above uniform,
+    # use it as a hint for the center (the value is likely near this threshold)
+    uniform_p = 1.0 / n
+    if max_prob > uniform_p * 1.5:
+        # Blend: 70% median, 30% ensemble hint
+        hint_value = thresholds[max_prob_idx][1]
+        center_value = 0.5 * center_value + 0.5 * hint_value
+    
+    # Calculate the spread (standard deviation estimate)
+    # Use the range of thresholds to estimate volatility
+    min_val = thresholds[0][1]
+    max_val = thresholds[-1][1]
+    value_range = max_val - min_val
+    
+    if value_range == 0:
+        return probabilities  # All same value, can't correct
+    
+    # Estimate sigma as ~1/4 of the range (covers ~95% of distribution)
+    sigma = value_range / 4.0
+    if sigma == 0:
+        sigma = 1.0
+    
+    # Build logistic CDF probabilities
+    corrected = {}
+    for label, value in thresholds:
+        # Logistic CDF: P(X > threshold) = 1 / (1 + exp((threshold - center) / scale))
+        # scale ≈ sigma * sqrt(3) / pi for logistic approximation of normal
+        scale = sigma * 0.55  # Approximation
+        if scale == 0:
+            scale = 1.0
+        
+        z = (value - center_value) / scale
+        
+        if direction == "above":
+            # P(Above threshold) decreases as threshold increases
+            p = 1.0 / (1.0 + math.exp(z))
+        else:
+            # P(Below threshold) increases as threshold increases
+            p = 1.0 / (1.0 + math.exp(-z))
+        
+        # Clamp to [0.02, 0.98]
+        p = max(0.02, min(0.98, p))
+        corrected[label] = p
+    
+    logger.info(
+        f"Threshold correction applied: direction={direction}, "
+        f"center={center_value:.3f}, sigma={sigma:.3f}, "
+        f"range=[{min_val:.3f}, {max_val:.3f}]"
+    )
+    
+    return corrected
 
 
 # --- Non-Mutually-Exclusive Detection ---
@@ -400,6 +548,48 @@ def validate_event_request(data: dict) -> List[str]:
 # --- Prediction orchestration ---
 
 
+async def _extract_threshold_center_value(
+    event, search_text: str
+) -> Optional[float]:
+    """Use a cheap, fast LLM call to extract the current/expected numeric value.
+    
+    Uses gpt-4o-mini for cost efficiency (instead of full ensemble models).
+    
+    Returns the extracted center value, or None if extraction fails.
+    """
+    if not search_text.strip():
+        return None
+    
+    try:
+        extract_response = await asyncio.wait_for(
+            asyncio.to_thread(
+                ensemble_reasoner.openrouter_client.chat.completions.create,
+                model="openai/gpt-4o-mini",  # Cheap, fast model for extraction
+                max_tokens=50,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Based on this info, what is the current/expected numeric value for: "
+                        f"{event.title}?\n\nInfo: {search_text[:500]}\n\n"
+                        f"Return ONLY a single number (e.g., 4.55 or 2600000). If unsure, return 'unknown'."
+                    ),
+                }],
+            ),
+            timeout=15,
+        )
+        value_text = extract_response.choices[0].message.content.strip() if extract_response.choices else ""
+        # Try to parse the number
+        value_text = value_text.replace(',', '').replace('$', '').strip()
+        if value_text.lower() != 'unknown':
+            return float(value_text)
+    except (ValueError, TypeError):
+        pass
+    except Exception as e:
+        logger.debug(f"Center value extraction failed: {e}")
+    
+    return None
+
+
 async def process_single_event(event: EventRequest) -> Dict[str, float]:
     """Full prediction orchestration for a single event.
 
@@ -485,6 +675,92 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
     if cached is not None:
         logger.info(f"Cache hit for event {event.event_ticker}")
         return cached
+
+    # Step 2.5: Fast path for threshold events
+    # Threshold events (Above X, At least X) have ordered outcomes that should
+    # follow a cumulative distribution, not require full ensemble reasoning
+    from src.threshold_handler import is_threshold_event, generate_threshold_probabilities
+    
+    if is_threshold_event(event.outcomes):
+        logger.info(f"Threshold event detected for {event.event_ticker}: {event.title}")
+        
+        # Quick search to find current/expected value
+        threshold_probs = None
+        try:
+            # Search for the current value
+            search_result = search_client.search(
+                f"{event.title} current value latest",
+                max_results=3,
+                topic="news",
+                time_range="week",
+            )
+            
+            # Try to extract a center value from search results
+            center_value = None
+            search_items = search_result.get("results", [])
+            if search_items:
+                # Feed search results to a quick LLM call to extract the number
+                search_text = " ".join(
+                    item.get("content", "")[:200] for item in search_items[:3]
+                )
+                if search_text.strip():
+                    center_value = await _extract_threshold_center_value(
+                        event, search_text
+                    )
+                    if center_value is not None:
+                        logger.info(f"Extracted center value for threshold event: {center_value}")
+            
+            # Generate threshold probabilities
+            threshold_probs = generate_threshold_probabilities(
+                event.outcomes, center_value=center_value
+            )
+            
+        except Exception as e:
+            logger.warning(f"Threshold fast path failed: {e}")
+        
+        if threshold_probs:
+            logger.info(
+                f"Threshold event handled via fast path for {event.event_ticker}: "
+                f"center={center_value}, probs range [{min(threshold_probs.values()):.3f}, {max(threshold_probs.values()):.3f}]"
+            )
+            
+            # Cache and log
+            await cache.set(event, threshold_probs)
+            
+            prediction_log.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "event_ticker": event.event_ticker,
+                "title": event.title[:60],
+                "category": routing_config.category.value,
+                "outcomes": event.outcomes[:5],
+                "probabilities": {k: round(v, 4) for k, v in threshold_probs.items()},
+                "duration": round(time.time() - start_time, 1),
+                "had_disagreement": False,
+            })
+            if len(prediction_log) > 200:
+                prediction_log[:] = prediction_log[-200:]
+            
+            # Persist to JSONL
+            import json as _json
+            log_entry = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "event_ticker": event.event_ticker,
+                "title": event.title,
+                "category": routing_config.category.value,
+                "outcomes": event.outcomes,
+                "probabilities": {k: round(v, 4) for k, v in threshold_probs.items()},
+                "duration": round(time.time() - start_time, 1),
+                "had_disagreement": False,
+                "mutually_exclusive": True,
+                "threshold_event": True,
+            }
+            try:
+                with open("predictions_log.jsonl", "a") as f:
+                    f.write(_json.dumps(log_entry) + "\n")
+            except Exception:
+                pass
+            
+            return threshold_probs
 
     # Step 3: Research
     research_results = await run_parallel_research(
@@ -703,6 +979,12 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
         )
     else:
         calibrated = calibrator.calibrate(aggregated, normalize=mutually_exclusive)
+
+    # Step 7.1: Threshold correction for "Above X" / "At least X" events
+    # These need monotonically decreasing probabilities, not uniform
+    # Skip if we already have market prices (they're better than our CDF estimate)
+    if not market_prices:
+        calibrated = apply_threshold_correction(calibrated, event.outcomes, event.title)
 
     # Step 7.5: Confidence check — use market as default when we have no edge
     # Key hackathon insight: "Only make prediction when you are confident enough,
