@@ -672,7 +672,7 @@ class EnsembleReasoner:
         elif spread > 0.10:
             shrinkage = 0.90  # 10% shrinkage — moderate disagreement
         else:
-            shrinkage = 0.95  # 5% shrinkage — models agree (default)
+            shrinkage = 0.97  # 3% shrinkage — models agree, be confident
 
         # Logit-space averaging for each outcome
         aggregated_probs: Dict[str, float] = {}

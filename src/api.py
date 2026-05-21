@@ -244,6 +244,133 @@ def apply_threshold_correction(
     return corrected
 
 
+# --- Range-Bucket Correction ---
+
+
+def detect_range_buckets(outcomes: List[str]) -> Optional[dict]:
+    """Detect if outcomes are numeric range buckets (e.g., "120-139", "140-159", "<80", ">220").
+    
+    Returns dict with:
+        - buckets: list of (outcome_label, midpoint_value) sorted by midpoint
+    Or None if not a range-bucket pattern.
+    """
+    # Patterns for range buckets
+    range_pattern = r'^(\d[\d,.]*)\s*[-–to]+\s*(\d[\d,.]*)'  # "120-139" or "120 to 139"
+    below_pattern = r'^[<≤]?\s*(\d[\d,.]*)'  # "<80" or "Below 80"
+    above_pattern = r'^[>≥]?\s*(\d[\d,.]*)'  # ">220" or "Above 220"
+    below_word = r'^[Bb]elow\s+([\d,.]+)'
+    above_word = r'^[Aa]bove\s+([\d,.]+)'
+    
+    buckets = []
+    
+    for outcome in outcomes:
+        o = outcome.strip()
+        
+        # Try range pattern first: "120-139"
+        m = re.match(range_pattern, o)
+        if m:
+            try:
+                low = float(m.group(1).replace(",", ""))
+                high = float(m.group(2).replace(",", ""))
+                midpoint = (low + high) / 2.0
+                buckets.append((outcome, midpoint))
+                continue
+            except ValueError:
+                pass
+        
+        # Try "<80" or "Below X" (use value - half_step as midpoint)
+        m = re.match(below_word, o) or re.match(r'^<\s*([\d,.]+)', o)
+        if m:
+            try:
+                val = float(m.group(1).replace(",", ""))
+                buckets.append((outcome, val - 10))  # Approximate midpoint below
+                continue
+            except ValueError:
+                pass
+        
+        # Try ">220" or "Above X" (use value + half_step as midpoint)
+        m = re.match(above_word, o) or re.match(r'^>\s*([\d,.]+)', o)
+        if m:
+            try:
+                val = float(m.group(1).replace(",", ""))
+                buckets.append((outcome, val + 10))  # Approximate midpoint above
+                continue
+            except ValueError:
+                pass
+        
+        # Doesn't match any pattern
+        return None
+    
+    if len(buckets) < 3:
+        return None
+    
+    # Sort by midpoint
+    buckets.sort(key=lambda x: x[1])
+    return {"buckets": buckets}
+
+
+def apply_range_bucket_correction(
+    probabilities: Dict[str, float],
+    outcomes: List[str],
+) -> Dict[str, float]:
+    """Apply bell-curve correction for range-bucket events.
+    
+    For events like Trump posts (120-139, 140-159, ...) or approval ratings,
+    applies a normal distribution centered on the bucket with highest ensemble probability.
+    """
+    bucket_info = detect_range_buckets(outcomes)
+    if bucket_info is None:
+        return probabilities  # Not a range-bucket event
+    
+    buckets = bucket_info["buckets"]
+    n = len(buckets)
+    
+    # Find center: use the bucket with highest probability from ensemble
+    max_prob = 0.0
+    center_idx = n // 2
+    for i, (label, midpoint) in enumerate(buckets):
+        p = probabilities.get(label, 0.0)
+        if p > max_prob:
+            max_prob = p
+            center_idx = i
+    
+    center_midpoint = buckets[center_idx][1]
+    
+    # Calculate spread from bucket range
+    min_mid = buckets[0][1]
+    max_mid = buckets[-1][1]
+    total_range = max_mid - min_mid
+    if total_range == 0:
+        return probabilities
+    
+    sigma = total_range / 3.0  # ~99% within range
+    if sigma == 0:
+        sigma = 1.0
+    
+    # Apply normal distribution
+    corrected = {}
+    total = 0.0
+    for label, midpoint in buckets:
+        z = (midpoint - center_midpoint) / sigma
+        p = math.exp(-0.5 * z * z)  # Unnormalized Gaussian
+        corrected[label] = p
+        total += p
+    
+    # Normalize to sum to 1.0
+    if total > 0:
+        corrected = {k: max(0.02, v / total) for k, v in corrected.items()}
+        # Re-normalize after clamping
+        total2 = sum(corrected.values())
+        corrected = {k: v / total2 for k, v in corrected.items()}
+    
+    logger.info(
+        f"Range-bucket correction applied: center={center_midpoint:.1f}, "
+        f"sigma={sigma:.1f}, peak={max(corrected.values()):.3f}"
+    )
+    
+    return corrected
+
+
 # --- Non-Mutually-Exclusive Detection ---
 
 # Keywords that suggest a top-K / non-mutually-exclusive event
@@ -684,6 +811,37 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
         llm_client=async_llm_client,
     )
 
+    # Step 3.5: Entertainment boost — search for actual current rankings/charts
+    # For Netflix, Spotify, etc. events, the answer is often literally published
+    if routing_config.category == EventCategory.ENTERTAINMENT and search_client:
+        try:
+            # Search for the actual current chart/ranking data
+            chart_queries = [
+                f"{event.title} this week current",
+                f"{event.title} ranking chart today 2026",
+            ]
+            for query in chart_queries[:1]:  # Just 1 extra search to save credits
+                chart_results = search_client.search(
+                    query, max_results=3, topic="news", time_range="week"
+                )
+                chart_items = chart_results.get("results", [])
+                if chart_items and research_results:
+                    # Add chart evidence to the first research result
+                    for item in chart_items[:2]:
+                        content = item.get("content", "")
+                        if content:
+                            research_results[0].evidence.insert(0, EvidenceItem(
+                                source_url=item.get("url", "chart_search"),
+                                summary=f"[CURRENT CHART DATA] {content[:300]}",
+                                relevance_score=0.95,
+                                publication_date=None,
+                                corroborated=True,
+                            ))
+                    logger.info(f"Entertainment boost: added chart data for {event.event_ticker}")
+                    break
+        except Exception as e:
+            logger.debug(f"Entertainment chart search failed: {e}")
+
     # Step 4: Reason (run ensemble reasoner for each research result)
     prediction_results = []
     for research_result in research_results:
@@ -899,6 +1057,8 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
     # Skip if we already have market prices (they're better than our CDF estimate)
     if not market_prices:
         calibrated = apply_threshold_correction(calibrated, event.outcomes, event.title)
+        # Also try range-bucket correction (for "120-139", "140-159" style events)
+        calibrated = apply_range_bucket_correction(calibrated, event.outcomes)
 
     # Step 7.5: Confidence check — use market as default when we have no edge
     # Key hackathon insight: "Only make prediction when you are confident enough,
