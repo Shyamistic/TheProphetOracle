@@ -909,6 +909,25 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
         llm_client=async_llm_client,
     )
 
+    # Step 3.4: ESPN sports data injection
+    # For sports events, fetch LIVE data from ESPN (scores, odds, series status)
+    # This is deterministic data that beats any LLM guess
+    if routing_config.category == EventCategory.SPORTS and research_results:
+        try:
+            from src.sports_data import get_sports_context
+            sports_context = await get_sports_context(event.title, event.description)
+            if sports_context:
+                research_results[0].evidence.insert(0, EvidenceItem(
+                    source_url="espn://live-data",
+                    summary=sports_context,
+                    relevance_score=0.98,
+                    publication_date=None,
+                    corroborated=True,
+                ))
+                logger.info(f"ESPN data injected for {event.event_ticker}")
+        except Exception as e:
+            logger.debug(f"ESPN data fetch failed: {e}")
+
     # Step 3.5: Category-specific number extraction
     # For events where the answer is a PUBLISHED NUMBER (charts, counts, ratings),
     # search for the actual current value. This beats any LLM guess.
