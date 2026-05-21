@@ -58,9 +58,10 @@ prediction_log: List[Dict] = []
 def get_adaptive_anchor_weight(close_time_str: str, base_weight: float = 0.3) -> float:
     """Adjust market anchor weight based on time to resolution.
 
-    Near-term events (2-3 days): market is very efficient, anchor 80%
-    Medium-term (4-7 days): balanced, anchor 50%
-    Long-term (8-14 days): market less efficient, anchor 30%
+    Near-term events (1-2 days): market is extremely efficient, anchor 90%
+    Short-term (2-4 days): market very efficient, anchor 80%
+    Medium-term (4-7 days): balanced, anchor 55%
+    Long-term (8-14 days): market less efficient, anchor 35%
 
     Args:
         close_time_str: ISO format close time string.
@@ -74,12 +75,14 @@ def get_adaptive_anchor_weight(close_time_str: str, base_weight: float = 0.3) ->
         now = datetime.now(timezone.utc)
         days_remaining = (close_time - now).total_seconds() / 86400
 
-        if days_remaining <= 3:
-            return 0.80  # Market very efficient near resolution
+        if days_remaining <= 2:
+            return 0.90  # Market extremely efficient near resolution
+        elif days_remaining <= 4:
+            return 0.80  # Market very efficient
         elif days_remaining <= 7:
-            return 0.50  # Balanced
+            return 0.55  # Balanced
         else:
-            return 0.30  # Trust our research more for longer-term
+            return 0.35  # Trust our research more for longer-term
     except Exception:
         return base_weight
 
@@ -797,6 +800,77 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
             search_strategies=routing_config.search_strategies[:1],
         )
 
+    # Step 1.5: KALSHI-FIRST STRATEGY
+    # If Kalshi returns prices for most outcomes, use them directly.
+    # The market is almost always right. Skip expensive ensemble.
+    # This is what top teams (Brier Patch, Shirish) do.
+    if market_prices and len(market_prices) >= len(event.outcomes) * 0.6:
+        # Check if prices are "liquid" (not all at 0.5 or extremes)
+        price_values = list(market_prices.values())
+        has_signal = any(abs(p - 0.5) > 0.03 for p in price_values)
+        
+        if has_signal:
+            # Use market prices directly with small safety shrink toward uniform
+            shrink_alpha = 0.03  # 3% shrink toward 0.5 (safety margin)
+            kalshi_direct = {}
+            for outcome in event.outcomes:
+                p = market_prices.get(outcome, 1.0 / len(event.outcomes))
+                # Shrink toward 0.5 slightly
+                p = p * (1 - shrink_alpha) + 0.5 * shrink_alpha
+                # Clamp
+                p = max(0.02, min(0.98, p))
+                kalshi_direct[outcome] = p
+            
+            # Normalize for mutually exclusive events
+            if mutually_exclusive:
+                total = sum(kalshi_direct.values())
+                if total > 0:
+                    kalshi_direct = {k: v / total for k, v in kalshi_direct.items()}
+            
+            logger.info(
+                f"KALSHI-FIRST: Using market prices directly for {event.event_ticker} "
+                f"({len(market_prices)}/{len(event.outcomes)} outcomes covered). "
+                f"Skipping ensemble. Prices: {{{', '.join(f'{k}: {v:.3f}' for k, v in list(kalshi_direct.items())[:5])}}}"
+            )
+            
+            # Cache and log
+            await cache.set(event, kalshi_direct)
+            
+            prediction_log.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "event_ticker": event.event_ticker,
+                "title": event.title[:60],
+                "category": routing_config.category.value,
+                "outcomes": event.outcomes[:5],
+                "probabilities": {k: round(v, 4) for k, v in kalshi_direct.items()},
+                "duration": round(time.time() - start_time, 1),
+                "had_disagreement": False,
+            })
+            if len(prediction_log) > 200:
+                prediction_log[:] = prediction_log[-200:]
+            
+            # Persist to JSONL
+            import json as _json
+            log_entry = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "event_ticker": event.event_ticker,
+                "title": event.title,
+                "category": routing_config.category.value,
+                "outcomes": event.outcomes,
+                "probabilities": {k: round(v, 4) for k, v in kalshi_direct.items()},
+                "duration": round(time.time() - start_time, 1),
+                "had_disagreement": False,
+                "mutually_exclusive": mutually_exclusive,
+                "kalshi_first": True,
+            }
+            try:
+                with open("predictions_log.jsonl", "a") as f:
+                    f.write(_json.dumps(log_entry) + "\n")
+            except Exception:
+                pass
+            
+            return kalshi_direct
+
     # Step 2: Cache check
     cached = await cache.get(event)
     if cached is not None:
@@ -1059,6 +1133,26 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
         calibrated = apply_threshold_correction(calibrated, event.outcomes, event.title)
         # Also try range-bucket correction (for "120-139", "140-159" style events)
         calibrated = apply_range_bucket_correction(calibrated, event.outcomes)
+
+    # Step 7.2: Market sanity guardrail
+    # If our prediction deviates >0.25 from Kalshi on any outcome, anchor back toward market
+    # This prevents catastrophic Brier scores from overconfident LLM predictions
+    if market_prices:
+        max_deviation = max(
+            abs(calibrated.get(o, 0.5) - market_prices.get(o, 0.5))
+            for o in event.outcomes if o in market_prices
+        )
+        if max_deviation > 0.25:
+            # Anchor 60% toward market, 40% our prediction
+            logger.info(
+                f"Market sanity guardrail triggered for {event.event_ticker}: "
+                f"max deviation {max_deviation:.3f} > 0.25, anchoring toward market"
+            )
+            for outcome in event.outcomes:
+                if outcome in market_prices:
+                    our_p = calibrated.get(outcome, 0.5)
+                    market_p = market_prices[outcome]
+                    calibrated[outcome] = 0.4 * our_p + 0.6 * market_p
 
     # Step 7.5: Confidence check — use market as default when we have no edge
     # Key hackathon insight: "Only make prediction when you are confident enough,
