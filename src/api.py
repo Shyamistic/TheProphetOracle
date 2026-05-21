@@ -23,6 +23,12 @@ from tavily import TavilyClient
 from src.aggregator import aggregate_predictions
 from src.cache import PredictionCache
 from src.calibrator import CalibrationModule
+from src.calibration_refit import (
+    apply_calibration,
+    check_resolutions,
+    store_prediction,
+    get_calibration_status,
+)
 from src.config import AgentConfig, load_config
 from src.cost_tracker import CostTracker
 from src.ensemble_reasoner import EnsembleReasoner
@@ -365,6 +371,15 @@ def apply_range_bucket_correction(
     # Normalize to sum to 1.0
     if total > 0:
         corrected = {k: max(0.02, v / total) for k, v in corrected.items()}
+        # Soft cap on tail outcomes: tails should never dominate without hard evidence
+        # For 7+ bucket events, cap the extreme tails at 0.20
+        if n >= 7:
+            tail_cap = 0.20
+            # First and last buckets are tails
+            tail_labels = [buckets[0][0], buckets[-1][0]]
+            for label in tail_labels:
+                if label in corrected and corrected[label] > tail_cap:
+                    corrected[label] = tail_cap
         # Re-normalize after clamping
         total2 = sum(corrected.values())
         corrected = {k: v / total2 for k, v in corrected.items()}
@@ -872,6 +887,12 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
             except Exception:
                 pass
             
+            # Store for calibration refit
+            try:
+                store_prediction(event.event_ticker, kalshi_direct)
+            except Exception:
+                pass
+            
             return kalshi_direct
 
     # Step 2: Cache check
@@ -888,36 +909,87 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
         llm_client=async_llm_client,
     )
 
-    # Step 3.5: Entertainment boost — search for actual current rankings/charts
-    # For Netflix, Spotify, etc. events, the answer is often literally published
-    if routing_config.category == EventCategory.ENTERTAINMENT and search_client:
-        try:
-            # Search for the actual current chart/ranking data
-            chart_queries = [
-                f"{event.title} this week current",
-                f"{event.title} ranking chart today 2026",
-            ]
-            for query in chart_queries[:1]:  # Just 1 extra search to save credits
-                chart_results = search_client.search(
-                    query, max_results=3, topic="news", time_range="week"
-                )
-                chart_items = chart_results.get("results", [])
-                if chart_items and research_results:
-                    # Add chart evidence to the first research result
-                    for item in chart_items[:2]:
-                        content = item.get("content", "")
-                        if content:
-                            research_results[0].evidence.insert(0, EvidenceItem(
-                                source_url=item.get("url", "chart_search"),
-                                summary=f"[CURRENT CHART DATA] {content[:300]}",
-                                relevance_score=0.95,
-                                publication_date=None,
-                                corroborated=True,
-                            ))
-                    logger.info(f"Entertainment boost: added chart data for {event.event_ticker}")
-                    break
-        except Exception as e:
-            logger.debug(f"Entertainment chart search failed: {e}")
+    # Step 3.5: Category-specific number extraction
+    # For events where the answer is a PUBLISHED NUMBER (charts, counts, ratings),
+    # search for the actual current value. This beats any LLM guess.
+    _number_search_triggers = {
+        EventCategory.ENTERTAINMENT: [
+            ("netflix", "Netflix top 10 US most watched show this week"),
+            ("spotify", "Spotify top chart this week global"),
+            ("box office", "box office opening weekend numbers"),
+            ("billboard", "Billboard Hot 100 chart this week"),
+            ("streaming", "streaming viewership numbers this week"),
+        ],
+        EventCategory.GEOPOLITICS: [
+            ("truth social", "Trump Truth Social posts count this week"),
+            ("approval", "presidential approval rating latest poll 538"),
+            ("poll", "latest polling numbers today"),
+        ],
+        EventCategory.ECONOMICS: [
+            ("gas price", "national average gas price today AAA"),
+            ("unemployment", "unemployment rate latest BLS"),
+            ("inflation", "CPI inflation rate latest"),
+            ("interest rate", "federal funds rate current"),
+        ],
+    }
+    
+    if search_client and research_results:
+        title_lower = event.title.lower()
+        triggers = _number_search_triggers.get(routing_config.category, [])
+        # Also always check geopolitics triggers for Truth Social / approval
+        if routing_config.category != EventCategory.GEOPOLITICS:
+            triggers += _number_search_triggers.get(EventCategory.GEOPOLITICS, [])
+        
+        for keyword, query_template in triggers:
+            if keyword in title_lower:
+                try:
+                    # Use the specific query or fall back to title-based
+                    search_query = query_template if keyword in title_lower else f"{event.title} current data this week"
+                    chart_results = search_client.search(
+                        search_query, max_results=3, topic="news", time_range="week"
+                    )
+                    chart_items = chart_results.get("results", [])
+                    if chart_items:
+                        for item in chart_items[:2]:
+                            content = item.get("content", "")
+                            if content:
+                                research_results[0].evidence.insert(0, EvidenceItem(
+                                    source_url=item.get("url", "number_extraction"),
+                                    summary=f"[CURRENT DATA - {keyword.upper()}] {content[:300]}",
+                                    relevance_score=0.97,
+                                    publication_date=None,
+                                    corroborated=True,
+                                ))
+                        logger.info(
+                            f"Number extraction boost ({keyword}): added data for {event.event_ticker}"
+                        )
+                    break  # Only do one targeted search per event
+                except Exception as e:
+                    logger.debug(f"Number extraction search failed ({keyword}): {e}")
+                break
+        else:
+            # Fallback: generic entertainment/chart search if no specific trigger matched
+            if routing_config.category == EventCategory.ENTERTAINMENT:
+                try:
+                    chart_results = search_client.search(
+                        f"{event.title} this week current ranking",
+                        max_results=3, topic="news", time_range="week"
+                    )
+                    chart_items = chart_results.get("results", [])
+                    if chart_items:
+                        for item in chart_items[:2]:
+                            content = item.get("content", "")
+                            if content:
+                                research_results[0].evidence.insert(0, EvidenceItem(
+                                    source_url=item.get("url", "chart_search"),
+                                    summary=f"[CURRENT CHART DATA] {content[:300]}",
+                                    relevance_score=0.95,
+                                    publication_date=None,
+                                    corroborated=True,
+                                ))
+                        logger.info(f"Entertainment boost: added chart data for {event.event_ticker}")
+                except Exception as e:
+                    logger.debug(f"Entertainment chart search failed: {e}")
 
     # Step 4: Reason (run ensemble reasoner for each research result)
     prediction_results = []
@@ -1179,6 +1251,11 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
                 if total > 0:
                     calibrated = {k: v / total for k, v in calibrated.items()}
 
+    # Step 7.9: Apply calibration refit (Platt scaling from resolved outcomes)
+    # This is Brier Patch's key insight — continuously recalibrate based on results
+    if mutually_exclusive:
+        calibrated = apply_calibration(calibrated)
+
     # Step 8: Validate response
     is_valid, violations = validator.validate(calibrated, event.outcomes, mutually_exclusive=mutually_exclusive)
     if not is_valid:
@@ -1236,6 +1313,20 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
             f.write(_json.dumps(log_entry) + "\n")
     except Exception:
         pass  # Don't let logging failures break predictions
+
+    # Store prediction for calibration refit (non-blocking)
+    try:
+        store_prediction(event.event_ticker, calibrated)
+    except Exception:
+        pass
+
+    # Periodically check for resolved markets (every ~10 predictions)
+    # This is lightweight and non-blocking
+    if len(prediction_log) % 10 == 0:
+        try:
+            asyncio.create_task(check_resolutions())
+        except Exception:
+            pass
 
     return calibrated
 
@@ -1499,6 +1590,12 @@ async def health_check() -> dict:
 async def get_costs() -> dict:
     """Returns cumulative cost summary."""
     return cost_tracker.get_summary()
+
+
+@app.get("/calibration")
+async def get_calibration() -> dict:
+    """Returns current calibration refit status."""
+    return get_calibration_status()
 
 
 @app.get("/api-status")

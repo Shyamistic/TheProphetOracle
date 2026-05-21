@@ -253,6 +253,7 @@ class EnsembleReasoner:
 
         If models disagree significantly (>15% spread) and Featherless is available,
         adds a 4th tiebreaker opinion before computing the median.
+        Skips tiebreaker for near-term events (≤2 days) since market anchor saves us.
 
         Graceful degradation:
         - 3 models succeed → median of 3
@@ -299,6 +300,20 @@ class EnsembleReasoner:
 
         had_disagreement = False
 
+        # Determine if this is a near-term event (≤2 days) — skip tiebreaker to save latency
+        skip_tiebreaker = False
+        try:
+            from datetime import datetime, timezone
+            close_time = datetime.fromisoformat(event.close_time.replace("Z", "+00:00"))
+            days_remaining = (close_time - datetime.now(timezone.utc)).total_seconds() / 86400
+            if days_remaining <= 2:
+                skip_tiebreaker = True
+                logger.info(
+                    f"Near-term event ({days_remaining:.1f} days), skipping tiebreaker"
+                )
+        except Exception:
+            pass
+
         if len(successful_results) == 1:
             # Only one model succeeded — use its result directly
             probs, trace = successful_results[0]
@@ -307,6 +322,7 @@ class EnsembleReasoner:
             # Multiple models succeeded — check for disagreement
             if (
                 self.featherless_client is not None
+                and not skip_tiebreaker
                 and self._models_disagree(successful_results, event.outcomes)
             ):
                 had_disagreement = True
@@ -330,9 +346,12 @@ class EnsembleReasoner:
                 except Exception as e:
                     logger.warning(f"Featherless tiebreaker failed: {e}")
             elif self._models_disagree(successful_results, event.outcomes):
-                # Disagreement detected but no Featherless client
+                # Disagreement detected but no Featherless client or skipped
                 had_disagreement = True
-                logger.info("Ensemble: models disagree >15% (no tiebreaker available)")
+                if skip_tiebreaker:
+                    logger.info("Ensemble: models disagree >15% (tiebreaker skipped — near-term event)")
+                else:
+                    logger.info("Ensemble: models disagree >15% (no tiebreaker available)")
 
             # Aggregate using logit-space averaging (BLF method)
             probs, trace = self._aggregate_logit_average(successful_results, event.outcomes, mutually_exclusive=mutually_exclusive)
