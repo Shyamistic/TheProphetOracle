@@ -58,7 +58,8 @@ prediction_log: List[Dict] = []
 def get_adaptive_anchor_weight(close_time_str: str, base_weight: float = 0.3) -> float:
     """Adjust market anchor weight based on time to resolution.
 
-    Near-term events (1-2 days): market is extremely efficient, anchor 90%
+    Imminent (≤1 day): market is essentially efficient, anchor 95%
+    Near-term (1-2 days): market is extremely efficient, anchor 90%
     Short-term (2-4 days): market very efficient, anchor 80%
     Medium-term (4-7 days): balanced, anchor 55%
     Long-term (8-14 days): market less efficient, anchor 35%
@@ -75,7 +76,9 @@ def get_adaptive_anchor_weight(close_time_str: str, base_weight: float = 0.3) ->
         now = datetime.now(timezone.utc)
         days_remaining = (close_time - now).total_seconds() / 86400
 
-        if days_remaining <= 2:
+        if days_remaining <= 1:
+            return 0.95  # Imminent: don't fight the market
+        elif days_remaining <= 2:
             return 0.90  # Market extremely efficient near resolution
         elif days_remaining <= 4:
             return 0.80  # Market very efficient

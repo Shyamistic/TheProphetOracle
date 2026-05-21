@@ -665,14 +665,27 @@ class EnsembleReasoner:
                 p = max(0.01, min(0.99, p))
                 probs_per_outcome[outcome].append(p)
 
-        # Adaptive shrinkage: more shrinkage when models disagree
+        # Adaptive logit scaling: shrink when models disagree, EXTREMIZE when they agree.
+        # When independent models converge on the same direction, Bayesian updating says
+        # the joint posterior should be MORE extreme than any single model — this is the
+        # extremizing trick that top forecasters (incl. partini) use.
         spread = max(max(probs) - min(probs) for probs in probs_per_outcome.values())
         if spread > 0.20:
-            shrinkage = 0.85  # 15% shrinkage — models very uncertain
+            logit_scale = 0.85  # 15% shrinkage — models very uncertain
+            mode = "shrink-high-spread"
         elif spread > 0.10:
-            shrinkage = 0.90  # 10% shrinkage — moderate disagreement
+            logit_scale = 0.90  # 10% shrinkage — moderate disagreement
+            mode = "shrink-mid-spread"
+        elif spread > 0.05:
+            logit_scale = 1.00  # neutral — small disagreement, trust raw average
+            mode = "neutral"
         else:
-            shrinkage = 0.97  # 3% shrinkage — models agree, be confident
+            logit_scale = 1.18  # 18% extremize — models strongly agree, push away from 0.5
+            mode = "extremize"
+
+        logger.info(
+            f"Logit aggregation: spread={spread:.3f} mode={mode} scale={logit_scale:.2f}"
+        )
 
         # Logit-space averaging for each outcome
         aggregated_probs: Dict[str, float] = {}
@@ -681,8 +694,10 @@ class EnsembleReasoner:
             # Convert to logits, average, convert back
             logits = [math.log(p / (1.0 - p)) for p in values]
             avg_logit = sum(logits) / len(logits)
-            # Apply shrinkage toward 0 (pull toward 0.5) for robustness
-            avg_logit = avg_logit * shrinkage
+            # Scale logit: shrink (toward 0.5) on disagreement, extremize (away from 0.5) on agreement
+            avg_logit = avg_logit * logit_scale
+            # Safety cap so we never produce >0.98 / <0.02 from extremizing alone
+            avg_logit = max(-3.9, min(3.9, avg_logit))
             # Convert back to probability
             aggregated_probs[outcome] = 1.0 / (1.0 + math.exp(-avg_logit))
 
