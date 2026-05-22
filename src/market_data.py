@@ -377,6 +377,13 @@ async def get_market_prices(
     if kalshi_prices:
         sources_used.append("Kalshi")
 
+    # Strategy 3: Kalshi keyword search (for events where ticker doesn't match)
+    # e.g., "Top USA Song on Spotify" might match Kalshi's "Billboard Hot 100" event
+    if not kalshi_prices and title and len(outcomes) > 2:
+        kalshi_prices = await _kalshi_keyword_search(title, outcomes)
+        if kalshi_prices:
+            sources_used.append("Kalshi-keyword")
+
     # --- Polymarket (only for binary markets with a title) ---
     polymarket_prices = None
     if title and len(outcomes) == 2:
@@ -406,6 +413,119 @@ async def get_market_prices(
         return polymarket_prices
 
     return None
+
+
+async def _kalshi_keyword_search(
+    title: str, outcomes: List[str]
+) -> Optional[Dict[str, float]]:
+    """Search Kalshi events by title keywords when direct ticker lookup fails.
+    
+    This catches cases like:
+    - "Top USA Song on Spotify" matching Kalshi's "Billboard Hot 100" event
+    - "Netflix #1 show" matching Kalshi's streaming event
+    
+    Only returns prices if we find a strong match with overlapping outcomes.
+    Prefers events with the closest date to now.
+    """
+    if not title:
+        return None
+    
+    # Extract key search terms from the title
+    title_lower = title.lower()
+    
+    # Map of keywords to Kalshi series tickers to try
+    keyword_series_map = [
+        (["song", "spotify", "music", "billboard", "hot 100"], ["KXTOPSONG", "KXSPOTIFY"]),
+        (["netflix", "streaming", "show", "most-watched"], ["KXNETFLIX", "KXTOPSHOW"]),
+        (["trump", "truth social", "posts"], ["KXTRUTHSOCIAL", "KXTRUMPPOSTS"]),
+        (["approval", "rating", "favorability"], ["KXAPPROVAL", "KXTRUMPAPPROVAL"]),
+    ]
+    
+    series_to_try = []
+    for keywords, series_list in keyword_series_map:
+        if any(kw in title_lower for kw in keywords):
+            series_to_try.extend(series_list)
+    
+    if not series_to_try:
+        return None
+    
+    try:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for series_ticker in series_to_try:
+                resp = await client.get(
+                    f"{KALSHI_BASE_URL}/events",
+                    params={"limit": 10, "status": "open", "series_ticker": series_ticker},
+                )
+                if resp.status_code != 200:
+                    continue
+                
+                data = resp.json()
+                events = data.get("events", [])
+                
+                # Sort events by close date (prefer nearest to now)
+                # Try close_date field first, then extract from ticker (e.g., KXTOPSONG-26MAY30)
+                def event_sort_key(e):
+                    try:
+                        close = e.get("close_date") or e.get("expected_expiration_time") or ""
+                        if close:
+                            dt = datetime.fromisoformat(close.replace("Z", "+00:00"))
+                            return abs((dt - now).total_seconds())
+                    except Exception:
+                        pass
+                    # Fallback: extract date from ticker (format: SERIES-YYMMMDD)
+                    try:
+                        ticker = e.get("event_ticker", "")
+                        # Extract date portion like "26MAY30" from "KXTOPSONG-26MAY30"
+                        import re as _re
+                        date_match = _re.search(r'(\d{2})([A-Z]{3})(\d{2})$', ticker)
+                        if date_match:
+                            year = int("20" + date_match.group(1))
+                            month_str = date_match.group(2)
+                            day = int(date_match.group(3))
+                            months = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+                                      "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+                            month = months.get(month_str, 1)
+                            dt = datetime(year, month, day, tzinfo=timezone.utc)
+                            return abs((dt - now).total_seconds())
+                    except Exception:
+                        pass
+                    return 999999999
+                
+                events.sort(key=event_sort_key)
+                
+                for event in events:
+                    event_ticker = event.get("event_ticker", "")
+                    event_title = event.get("title", "").lower()
+                    
+                    # Check if this event is about the same time period
+                    title_words = set(title_lower.split())
+                    event_words = set(event_title.split())
+                    overlap = len(title_words & event_words)
+                    
+                    if overlap < 2:
+                        continue
+                    
+                    # Found a potential match — fetch its markets
+                    event_prices = await fetch_kalshi_event_markets(event_ticker)
+                    if not event_prices:
+                        continue
+                    
+                    # Try to match outcomes
+                    matched = _match_outcomes(event_prices, outcomes)
+                    if matched and len(matched) >= len(outcomes) * 0.5:
+                        logger.info(
+                            f"Kalshi keyword search matched: '{title[:40]}' -> "
+                            f"'{event.get('title', '')[:40]}' ({event_ticker})"
+                        )
+                        return matched
+        
+        return None
+    except Exception as e:
+        logger.debug(f"Kalshi keyword search failed: {e}")
+        return None
 
 
 def _outcomes_match(prices: Dict[str, float], outcomes: List[str]) -> bool:
@@ -508,6 +628,39 @@ def _match_outcomes(
                 matched[outcome] = price
                 break
     if len(matched) == len(outcomes):
+        return matched
+
+    # Fuzzy prefix match (for truncated outcome labels like "Choosin' Tex" vs "Choosin' Texas")
+    if not matched or len(matched) < len(outcomes) * 0.5:
+        matched = {}
+        for outcome in outcomes:
+            outcome_clean = outcome.lower().strip().rstrip(".")
+            best_price = None
+            best_overlap = 0
+            for label, price in prices.items():
+                label_clean = label.lower().strip().rstrip(".")
+                # Check if first 8+ chars match (handles truncation)
+                min_len = min(len(outcome_clean), len(label_clean))
+                if min_len >= 6:
+                    prefix_len = 0
+                    for i in range(min_len):
+                        if outcome_clean[i] == label_clean[i]:
+                            prefix_len += 1
+                        else:
+                            break
+                    if prefix_len >= 6 and prefix_len > best_overlap:
+                        best_overlap = prefix_len
+                        best_price = price
+            if best_price is not None:
+                matched[outcome] = best_price
+
+    # Accept partial matches (≥50% of outcomes) — fill unmatched with low probability
+    if len(matched) >= len(outcomes) * 0.5:
+        # Fill unmatched outcomes with a small default probability
+        remaining_prob = max(0.01, (1.0 - sum(matched.values())) / max(1, len(outcomes) - len(matched)))
+        for outcome in outcomes:
+            if outcome not in matched:
+                matched[outcome] = min(remaining_prob, 0.05)
         return matched
 
     return None
