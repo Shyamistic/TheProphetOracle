@@ -210,8 +210,8 @@ async def fetch_kalshi_event_markets(event_ticker: str) -> Optional[Dict[str, fl
 async def fetch_polymarket_price(title: str) -> Optional[Dict[str, float]]:
     """Fetch market prices from Polymarket's public Gamma API by searching for a matching market.
 
-    Searches Polymarket for a market matching the event title and returns
-    outcome -> probability mapping if found.
+    Handles both binary (Yes/No) and multi-outcome events.
+    For multi-outcome, searches Polymarket events API which groups related markets.
 
     Args:
         title: The event title to search for on Polymarket.
@@ -223,8 +223,96 @@ async def fetch_polymarket_price(title: str) -> Optional[Dict[str, float]]:
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            # Search Polymarket gamma API with the event title
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            # Strategy 1: Search Polymarket events (handles multi-outcome)
+            # Polymarket events API groups related markets under one event
+            events_resp = await client.get(
+                "https://gamma-api.polymarket.com/events",
+                params={
+                    "closed": "false",
+                    "limit": 10,
+                    "active": "true",
+                },
+            )
+            
+            title_lower = title.lower()
+            title_words = set(title_lower.split())
+            
+            if events_resp.status_code == 200:
+                events = events_resp.json()
+                if isinstance(events, list):
+                    for event in events:
+                        event_title = (event.get("title") or event.get("question") or "").lower()
+                        event_words = set(event_title.split())
+                        overlap = len(title_words & event_words)
+                        score = overlap / max(len(title_words), 1)
+                        
+                        if score >= 0.35:
+                            # Found a matching event — extract outcome prices
+                            markets = event.get("markets", [])
+                            if markets and len(markets) >= 2:
+                                # Multi-outcome event
+                                prices = {}
+                                for mkt in markets:
+                                    outcome_label = (
+                                        mkt.get("groupItemTitle") or
+                                        mkt.get("question") or
+                                        mkt.get("title") or ""
+                                    )
+                                    # Clean up the label
+                                    outcome_label = outcome_label.strip()
+                                    
+                                    # Get the price
+                                    price = None
+                                    outcome_prices = mkt.get("outcomePrices")
+                                    if outcome_prices:
+                                        if isinstance(outcome_prices, str):
+                                            import json
+                                            try:
+                                                pl = json.loads(outcome_prices)
+                                                if pl:
+                                                    price = float(pl[0])
+                                            except (json.JSONDecodeError, TypeError, ValueError, IndexError):
+                                                pass
+                                        elif isinstance(outcome_prices, list) and outcome_prices:
+                                            try:
+                                                price = float(outcome_prices[0])
+                                            except (TypeError, ValueError):
+                                                pass
+                                    
+                                    if not price:
+                                        best_bid = mkt.get("bestBid")
+                                        if best_bid:
+                                            try:
+                                                price = float(best_bid)
+                                            except (TypeError, ValueError):
+                                                pass
+                                    
+                                    if outcome_label and price is not None and 0.0 <= price <= 1.0:
+                                        prices[outcome_label] = price
+                                
+                                if len(prices) >= 2:
+                                    logger.info(
+                                        f"Polymarket multi-outcome match for '{title[:40]}': "
+                                        f"{len(prices)} outcomes (score={score:.2f})"
+                                    )
+                                    return prices
+                            
+                            # Single market in event — binary
+                            elif markets and len(markets) == 1:
+                                mkt = markets[0]
+                                outcome_prices = mkt.get("outcomePrices")
+                                if outcome_prices:
+                                    if isinstance(outcome_prices, str):
+                                        import json
+                                        try:
+                                            pl = json.loads(outcome_prices)
+                                            if pl and len(pl) >= 2:
+                                                return {"Yes": float(pl[0]), "No": float(pl[1])}
+                                        except (json.JSONDecodeError, TypeError, ValueError):
+                                            pass
+
+            # Strategy 2: Fallback to markets endpoint (original binary approach)
             response = await client.get(
                 POLYMARKET_GAMMA_URL,
                 params={
@@ -233,20 +321,15 @@ async def fetch_polymarket_price(title: str) -> Optional[Dict[str, float]]:
                     "active": "true",
                     "ascending": "false",
                     "order": "liquidity",
-                    "tag": "",
-                    "slug": "",
                 },
             )
             if response.status_code != 200:
-                logger.debug(f"Polymarket API returned status {response.status_code}")
                 return None
 
             markets = response.json()
             if not isinstance(markets, list) or not markets:
                 return None
 
-            # Find the best matching market by title similarity
-            title_lower = title.lower()
             best_match = None
             best_score = 0.0
 
@@ -255,28 +338,19 @@ async def fetch_polymarket_price(title: str) -> Optional[Dict[str, float]]:
                 if not market_question:
                     continue
 
-                # Simple word overlap scoring
-                title_words = set(title_lower.split())
                 market_words = set(market_question.split())
-                if not title_words:
-                    continue
-
                 overlap = len(title_words & market_words)
                 score = overlap / max(len(title_words), 1)
 
-                if score > best_score and score >= 0.4:  # At least 40% word overlap
+                if score > best_score and score >= 0.4:
                     best_score = score
                     best_match = market
 
             if not best_match:
-                logger.debug(f"No Polymarket match found for: {title[:60]}")
                 return None
 
-            # Extract probabilities from the matched market
-            # Polymarket stores outcome prices in different formats
             outcomes_data = best_match.get("outcomePrices")
             if outcomes_data:
-                # outcomePrices is typically a JSON string like "[\"0.72\", \"0.28\"]"
                 if isinstance(outcomes_data, str):
                     import json
                     try:
@@ -292,24 +366,9 @@ async def fetch_polymarket_price(title: str) -> Optional[Dict[str, float]]:
                     try:
                         yes_prob = float(prices_list[0])
                         no_prob = float(prices_list[1])
-                        logger.debug(
-                            f"Polymarket match for '{title[:40]}': "
-                            f"Yes={yes_prob:.3f}, No={no_prob:.3f} "
-                            f"(match score: {best_score:.2f})"
-                        )
                         return {"Yes": yes_prob, "No": no_prob}
                     except (TypeError, ValueError, IndexError):
                         pass
-
-            # Fallback: try bestBid/bestAsk or other price fields
-            best_bid = best_match.get("bestBid")
-            if best_bid is not None:
-                try:
-                    yes_prob = float(best_bid)
-                    if 0.0 < yes_prob < 1.0:
-                        return {"Yes": yes_prob, "No": 1.0 - yes_prob}
-                except (TypeError, ValueError):
-                    pass
 
             return None
 
@@ -384,32 +443,49 @@ async def get_market_prices(
         if kalshi_prices:
             sources_used.append("Kalshi-keyword")
 
-    # --- Polymarket (only for binary markets with a title) ---
+    # --- Polymarket (for ALL events with a title) ---
     polymarket_prices = None
-    if title and len(outcomes) == 2:
+    if title:
         poly_raw = await fetch_polymarket_price(title)
-        if poly_raw and "Yes" in poly_raw:
-            # Map Yes/No to actual outcome labels
-            polymarket_prices = {outcomes[0]: poly_raw["Yes"], outcomes[1]: poly_raw["No"]}
-            sources_used.append("Polymarket")
+        if poly_raw:
+            if len(outcomes) == 2 and "Yes" in poly_raw and set(poly_raw.keys()) == {"Yes", "No"}:
+                # Binary: map Yes/No to actual outcome labels
+                polymarket_prices = {outcomes[0]: poly_raw["Yes"], outcomes[1]: poly_raw["No"]}
+            else:
+                # Multi-outcome: try to match labels
+                matched = _match_outcomes(poly_raw, outcomes)
+                if matched and len(matched) >= len(outcomes) * 0.5:
+                    polymarket_prices = matched
+                elif poly_raw and set(poly_raw.keys()) == set(outcomes):
+                    polymarket_prices = poly_raw
+            
+            if polymarket_prices:
+                sources_used.append("Polymarket")
 
     # --- Cross-reference: average if both available ---
     if kalshi_prices and polymarket_prices:
         averaged = {}
         for outcome in outcomes:
-            k_price = kalshi_prices.get(outcome, 0.5)
-            p_price = polymarket_prices.get(outcome, 0.5)
-            averaged[outcome] = (k_price + p_price) / 2.0
+            k_price = kalshi_prices.get(outcome)
+            p_price = polymarket_prices.get(outcome)
+            if k_price is not None and p_price is not None:
+                averaged[outcome] = (k_price + p_price) / 2.0
+            elif k_price is not None:
+                averaged[outcome] = k_price
+            elif p_price is not None:
+                averaged[outcome] = p_price
+            else:
+                averaged[outcome] = 1.0 / len(outcomes)
         logger.info(
             f"Market prices from {' + '.join(sources_used)} (averaged): "
-            f"{{{', '.join(f'{k}: {v:.3f}' for k, v in averaged.items())}}}"
+            f"{{{', '.join(f'{k}: {v:.3f}' for k, v in list(averaged.items())[:5])}}}"
         )
         return averaged
     elif kalshi_prices:
-        logger.info(f"Market prices from Kalshi only: {kalshi_prices}")
+        logger.info(f"Market prices from Kalshi only: {dict(list(kalshi_prices.items())[:5])}")
         return kalshi_prices
     elif polymarket_prices:
-        logger.info(f"Market prices from Polymarket only: {polymarket_prices}")
+        logger.info(f"Market prices from Polymarket only: {dict(list(polymarket_prices.items())[:5])}")
         return polymarket_prices
 
     return None
