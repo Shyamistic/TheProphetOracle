@@ -435,10 +435,11 @@ async def _kalshi_keyword_search(
     
     # Map of keywords to Kalshi series tickers to try
     keyword_series_map = [
-        (["song", "spotify", "music", "billboard", "hot 100"], ["KXTOPSONG", "KXSPOTIFY"]),
-        (["netflix", "streaming", "show", "most-watched"], ["KXNETFLIX", "KXTOPSHOW"]),
-        (["trump", "truth social", "posts"], ["KXTRUTHSOCIAL", "KXTRUMPPOSTS"]),
+        (["song", "spotify", "music", "billboard", "hot 100", "top song"], ["KXTOPSONG", "KXSPOTIFY"]),
+        (["netflix", "streaming", "show", "most-watched", "top show"], ["KXNETFLIXRANKSHOW", "KXNETFLIX", "KXTOPSHOW"]),
+        (["trump", "truth social", "posts", "truth"], ["KXTRUTHSOCIAL", "KXTRUMPPOSTS"]),
         (["approval", "rating", "favorability"], ["KXAPPROVAL", "KXTRUMPAPPROVAL"]),
+        (["photographed", "photo", "trump photo"], ["KXTRUMPPHOTO"]),
     ]
     
     series_to_try = []
