@@ -510,9 +510,11 @@ async def _kalshi_keyword_search(
     title_lower = title.lower()
     
     # Map of keywords to Kalshi series tickers to try
+    # NOTE: Only cross-reference when the platforms are genuinely interchangeable
+    # Do NOT cross-reference Spotify -> Billboard (different charts, different #1s)
     keyword_series_map = [
-        (["song", "spotify", "music", "billboard", "hot 100", "top song"], ["KXTOPSONG", "KXSPOTIFY"]),
-        (["netflix", "streaming", "show", "most-watched", "top show"], ["KXNETFLIXRANKSHOW", "KXNETFLIX", "KXTOPSHOW"]),
+        (["billboard", "hot 100", "weekly top songs usa"], ["KXTOPSONG"]),
+        (["netflix", "streaming", "most-watched", "top show"], ["KXNETFLIXRANKSHOW", "KXNETFLIX", "KXTOPSHOW"]),
         (["trump", "truth social", "posts", "truth"], ["KXTRUTHSOCIAL", "KXTRUMPPOSTS"]),
         (["approval", "rating", "favorability"], ["KXAPPROVAL", "KXTRUMPAPPROVAL"]),
         (["photographed", "photo", "trump photo"], ["KXTRUMPPHOTO"]),

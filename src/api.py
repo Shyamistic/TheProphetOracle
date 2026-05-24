@@ -839,8 +839,42 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
                 p = max(0.02, min(0.98, p))
                 kalshi_direct[outcome] = p
             
+            # CRITICAL: Apply threshold correction even on Kalshi-first path
+            # Kalshi can have stale/illiquid prices on far-out thresholds
+            # that violate monotonicity (e.g., Above 4.580 = 9.8% when Above 4.540 = 1.9%)
+            threshold_info = detect_threshold_outcomes(event.outcomes)
+            if threshold_info:
+                # Enforce monotonicity: each higher threshold must have <= probability
+                thresholds = threshold_info["thresholds"]
+                direction = threshold_info["direction"]
+                
+                if direction == "above":
+                    # P(Above X) must decrease as X increases
+                    prev_p = 1.0
+                    for label, value in thresholds:
+                        p = kalshi_direct.get(label, 0.5)
+                        if p > prev_p:
+                            kalshi_direct[label] = prev_p * 0.95  # Force decrease
+                        prev_p = kalshi_direct.get(label, p)
+                else:
+                    # P(Below X) must increase as X increases
+                    prev_p = 0.0
+                    for label, value in thresholds:
+                        p = kalshi_direct.get(label, 0.5)
+                        if p < prev_p:
+                            kalshi_direct[label] = prev_p * 1.05
+                        prev_p = kalshi_direct.get(label, p)
+                
+                # Re-normalize after monotonicity fix
+                if mutually_exclusive:
+                    total = sum(kalshi_direct.values())
+                    if total > 0:
+                        kalshi_direct = {k: v / total for k, v in kalshi_direct.items()}
+                
+                logger.info(f"Kalshi-first: monotonicity enforced for threshold event")
+            
             # Normalize for mutually exclusive events
-            if mutually_exclusive:
+            elif mutually_exclusive:
                 total = sum(kalshi_direct.values())
                 if total > 0:
                     kalshi_direct = {k: v / total for k, v in kalshi_direct.items()}
