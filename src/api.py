@@ -64,11 +64,15 @@ prediction_log: List[Dict] = []
 def get_adaptive_anchor_weight(close_time_str: str, base_weight: float = 0.3) -> float:
     """Adjust market anchor weight based on time to resolution.
 
-    Imminent (≤1 day): market is essentially efficient, anchor 95%
-    Near-term (1-2 days): market is extremely efficient, anchor 90%
-    Short-term (2-4 days): market very efficient, anchor 80%
-    Medium-term (4-7 days): balanced, anchor 55%
-    Long-term (8-14 days): market less efficient, anchor 35%
+    STRATEGY SHIFT: Top teams (Dr Strange +0.0025) barely deviate from market.
+    We were deviating too much and it hurt us (+0.1495 = worse than market).
+    Now anchor MUCH harder to market across all time horizons.
+
+    Imminent (≤1 day): 97% market
+    Near-term (1-2 days): 95% market
+    Short-term (2-4 days): 90% market
+    Medium-term (4-7 days): 80% market
+    Long-term (8-14 days): 65% market
 
     Args:
         close_time_str: ISO format close time string.
@@ -83,15 +87,15 @@ def get_adaptive_anchor_weight(close_time_str: str, base_weight: float = 0.3) ->
         days_remaining = (close_time - now).total_seconds() / 86400
 
         if days_remaining <= 1:
-            return 0.95  # Imminent: don't fight the market
+            return 0.97  # Imminent: essentially return market
         elif days_remaining <= 2:
-            return 0.90  # Market extremely efficient near resolution
+            return 0.95  # Near-term: barely deviate
         elif days_remaining <= 4:
-            return 0.80  # Market very efficient
+            return 0.90  # Short-term: very small deviation allowed
         elif days_remaining <= 7:
-            return 0.55  # Balanced
+            return 0.80  # Medium: modest deviation
         else:
-            return 0.35  # Trust our research more for longer-term
+            return 0.65  # Long-term: more room but still market-heavy
     except Exception:
         return base_weight
 
@@ -828,56 +832,75 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
         has_signal = any(abs(p - 0.5) > 0.03 for p in price_values)
         
         if has_signal:
-            # Use market prices directly with small safety shrink toward uniform
-            shrink_alpha = 0.03  # 3% shrink toward 0.5 (safety margin)
+            # Use market prices directly with minimal shrink toward uniform
+            shrink_alpha = 0.01  # 1% shrink (was 3% — top teams barely deviate from market)
             kalshi_direct = {}
             for outcome in event.outcomes:
                 p = market_prices.get(outcome, 1.0 / len(event.outcomes))
-                # Shrink toward 0.5 slightly
+                # Shrink toward 0.5 very slightly
                 p = p * (1 - shrink_alpha) + 0.5 * shrink_alpha
                 # Clamp
                 p = max(0.02, min(0.98, p))
                 kalshi_direct[outcome] = p
             
-            # CRITICAL: Apply threshold correction even on Kalshi-first path
-            # Kalshi can have stale/illiquid prices on far-out thresholds
-            # that violate monotonicity (e.g., Above 4.580 = 9.8% when Above 4.540 = 1.9%)
+            # CRITICAL: For threshold events, Kalshi prices are CDF values (P(Above X))
+            # NOT mutually exclusive probabilities. We need CDF differences.
+            # P(outcome "Above X" wins) = P(price > X) - P(price > X_next)
             threshold_info = detect_threshold_outcomes(event.outcomes)
             if threshold_info:
-                # Enforce monotonicity: each higher threshold must have <= probability
-                thresholds = threshold_info["thresholds"]
+                thresholds = threshold_info["thresholds"]  # sorted by value
                 direction = threshold_info["direction"]
                 
-                if direction == "above":
-                    # P(Above X) must decrease as X increases
-                    prev_p = 1.0
-                    for label, value in thresholds:
-                        p = kalshi_direct.get(label, 0.5)
-                        if p > prev_p:
-                            kalshi_direct[label] = prev_p * 0.95  # Force decrease
-                        prev_p = kalshi_direct.get(label, p)
-                else:
-                    # P(Below X) must increase as X increases
-                    prev_p = 0.0
-                    for label, value in thresholds:
-                        p = kalshi_direct.get(label, 0.5)
-                        if p < prev_p:
-                            kalshi_direct[label] = prev_p * 1.05
-                        prev_p = kalshi_direct.get(label, p)
+                # Convert CDF values to bucket probabilities
+                kalshi_direct = {}
+                for i in range(len(thresholds)):
+                    label, value = thresholds[i]
+                    cdf_val = market_prices.get(label, 0.5)
+                    
+                    if direction == "above":
+                        # P(Above X wins) = P(>X) - P(>X_next)
+                        if i < len(thresholds) - 1:
+                            next_label = thresholds[i + 1][0]
+                            next_cdf = market_prices.get(next_label, 0.0)
+                            bucket_prob = max(0.01, cdf_val - next_cdf)
+                        else:
+                            # Highest threshold: probability of being above it
+                            bucket_prob = max(0.01, cdf_val)
+                    else:
+                        # P(Below X wins) = P(<X) - P(<X_prev)
+                        if i > 0:
+                            prev_label = thresholds[i - 1][0]
+                            prev_cdf = market_prices.get(prev_label, 0.0)
+                            bucket_prob = max(0.01, cdf_val - prev_cdf)
+                        else:
+                            bucket_prob = max(0.01, cdf_val)
+                    
+                    kalshi_direct[label] = bucket_prob
                 
-                # Re-normalize after monotonicity fix
+                # Normalize to sum to 1
+                total = sum(kalshi_direct.values())
+                if total > 0:
+                    kalshi_direct = {k: v / total for k, v in kalshi_direct.items()}
+                
+                logger.info(
+                    f"KALSHI-FIRST (CDF-diff): threshold event {event.event_ticker}, "
+                    f"converted {len(thresholds)} CDF values to bucket probs. "
+                    f"Top: {sorted(kalshi_direct.items(), key=lambda x: -x[1])[:3]}"
+                )
+            else:
+                # Non-threshold event: use prices directly with minimal shrink
+                for outcome in event.outcomes:
+                    p = market_prices.get(outcome, 1.0 / len(event.outcomes))
+                    # Minimal shrink toward 0.5
+                    p = p * (1 - shrink_alpha) + 0.5 * shrink_alpha
+                    p = max(0.02, min(0.98, p))
+                    kalshi_direct[outcome] = p
+                
+                # Normalize for mutually exclusive events
                 if mutually_exclusive:
                     total = sum(kalshi_direct.values())
                     if total > 0:
                         kalshi_direct = {k: v / total for k, v in kalshi_direct.items()}
-                
-                logger.info(f"Kalshi-first: monotonicity enforced for threshold event")
-            
-            # Normalize for mutually exclusive events
-            elif mutually_exclusive:
-                total = sum(kalshi_direct.values())
-                if total > 0:
-                    kalshi_direct = {k: v / total for k, v in kalshi_direct.items()}
             
             logger.info(
                 f"KALSHI-FIRST: Using market prices directly for {event.event_ticker} "
@@ -1263,24 +1286,24 @@ async def process_single_event(event: EventRequest) -> Dict[str, float]:
         calibrated = apply_range_bucket_correction(calibrated, event.outcomes)
 
     # Step 7.2: Market sanity guardrail
-    # If our prediction deviates >0.25 from Kalshi on any outcome, anchor back toward market
-    # This prevents catastrophic Brier scores from overconfident LLM predictions
+    # If our prediction deviates >0.15 from Kalshi on any outcome, anchor back toward market
+    # Top teams barely deviate from market — we were deviating too much
     if market_prices:
         max_deviation = max(
             abs(calibrated.get(o, 0.5) - market_prices.get(o, 0.5))
             for o in event.outcomes if o in market_prices
         )
-        if max_deviation > 0.25:
-            # Anchor 60% toward market, 40% our prediction
+        if max_deviation > 0.15:
+            # Anchor 70% toward market, 30% our prediction (was 60/40)
             logger.info(
                 f"Market sanity guardrail triggered for {event.event_ticker}: "
-                f"max deviation {max_deviation:.3f} > 0.25, anchoring toward market"
+                f"max deviation {max_deviation:.3f} > 0.15, anchoring toward market"
             )
             for outcome in event.outcomes:
                 if outcome in market_prices:
                     our_p = calibrated.get(outcome, 0.5)
                     market_p = market_prices[outcome]
-                    calibrated[outcome] = 0.4 * our_p + 0.6 * market_p
+                    calibrated[outcome] = 0.30 * our_p + 0.70 * market_p
 
     # Step 7.5: Confidence check — use market as default when we have no edge
     # Key hackathon insight: "Only make prediction when you are confident enough,
